@@ -1,0 +1,23 @@
+# Environments
+arams_env/
+.conda/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Dataset folders
+data/
+images/
+*.tar.gz
+*.zip
+*.png
+*.jpg
+
+# Model Checkpoints & Logs
+checkpoints/
+*.pt
+*.bin
+runs/
+wandb/
+.vscode/
