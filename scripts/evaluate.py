@@ -76,8 +76,8 @@ results = {
 print("Running inference and evaluation...")
 for item in dataset:
     image = item["image"]
-    ref_raw = item["gt_normalized"]
-    book_id = item.get("book", "")
+    ref_raw = item["text"]
+    book_id = item["book_id"]
     
     pixel_values = custom_block_processor(image)
     

@@ -90,7 +90,7 @@ def preprocess_function(examples):
     for img in examples["image"]:
         pixel_values.append(custom_block_processor(img))
     
-    labels = tokenizer(examples["gt_normalized"], padding="max_length", max_length=128, truncation=True).input_ids
+    labels = tokenizer(examples["text"], padding="max_length", max_length=128, truncation=True).input_ids
     
     return {"pixel_values": pixel_values, "labels": labels}
 

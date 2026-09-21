@@ -17,21 +17,10 @@ os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 print("Environment initialized and HF routed to /kaggle/tmp")
 
-# Phase 3.1 & 3.2: Fetch and Stage Pre-trained Weights (assuming pip install kraken already run)
-print("Fetching pretrained Muharaf model...")
-subprocess.run(["kraken", "get", "10.5281/zenodo.14295489"], check=True)
-# The model will be downloaded to the current dir or ~/.config. We will just use it where it downloads.
-mlmodels = glob.glob("*.mlmodel")
-if mlmodels:
-    model_path = f"/kaggle/tmp/models/{mlmodels[0]}"
-    shutil.move(mlmodels[0], model_path)
-else:
-    # If saved in default kraken dir
-    model_path = os.path.expanduser("~/.kraken/10.5281_zenodo.14295489/muharaf.mlmodel") # approximate name
-    if not os.path.exists(model_path):
-        print("Warning: Could not automatically locate the downloaded .mlmodel file.")
-        model_path = "muharaf.mlmodel" # placeholder
-
+# Phase 3.1 & 3.2: Fetch and Stage Pre-trained Weights
+print("Fetching pretrained Muharaf model directly from Zenodo...")
+model_path = "/kaggle/tmp/models/muharaf_rec_best.mlmodel"
+subprocess.run(["wget", "-O", model_path, "https://zenodo.org/records/14295489/files/muharaf_rec_best.mlmodel?download=1"], check=True)
 print(f"Model staged at {model_path}")
 
 # Phase 2: Data Ingestion and Normalization Protocol
@@ -49,8 +38,8 @@ def prepare_split(split_name, output_dir):
     split_data = dataset[split_name]
     image_paths = []
     for i, item in enumerate(split_data):
-        # Target Transcription Isolation: use gt_normalized
-        text = item["gt_normalized"]
+        # Target Transcription Isolation: use text column which contains the normalized text
+        text = item["text"]
         image = item["image"]
         
         base_name = f"line_{i:06d}"
