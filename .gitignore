@@ -21,3 +21,5 @@ checkpoints/
 runs/
 wandb/
 .vscode/
+
+Kaggle_Guide.md
