@@ -66,7 +66,7 @@ subprocess.run(["ketos", "compile", "-f", "path", "-o", "/kaggle/tmp/data/arams_
 print("Launching ketos train...")
 train_cmd = [
     "ketos", "train",
-    "-d", "cuda:0",
+    "--device", "cuda:0",
     "--precision", "bf16-mixed",
     "-B", "32",
     "--resize", "new",
