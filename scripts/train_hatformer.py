@@ -146,6 +146,7 @@ def compute_metrics(pred):
 
     return {"cer": cer}
 
+from transformers import default_data_collator
 trainer = Seq2SeqTrainer(
     model=model,
     processing_class=tokenizer,
@@ -153,6 +154,7 @@ trainer = Seq2SeqTrainer(
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
     compute_metrics=compute_metrics,
+    data_collator=default_data_collator,
 )
 
 print("Starting HATFormer training...")

@@ -72,6 +72,7 @@ train_cmd = [
     "-B", "32",
     "--resize", "new",
     "-i", "/kaggle/tmp/models/muharaf_rec_best.mlmodel",
+    "-f", "binary",
     "-t", "/kaggle/tmp/data/arams_train.arrow",
     "-e", "/kaggle/tmp/data/arams_val.arrow"
 ]
