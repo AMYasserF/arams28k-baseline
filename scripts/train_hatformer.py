@@ -113,7 +113,7 @@ training_args = Seq2SeqTrainingArguments(
     generation_config=model.generation_config,
     save_strategy="epoch",
     eval_strategy="epoch",
-    logging_dir="/kaggle/tmp/logs", # Ephemeral
+
     save_total_limit=1, # Keep only the best
     metric_for_best_model="cer",
     greater_is_better=False,
@@ -148,7 +148,7 @@ def compute_metrics(pred):
 
 trainer = Seq2SeqTrainer(
     model=model,
-    tokenizer=tokenizer,
+    processing_class=tokenizer,
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=val_dataset,

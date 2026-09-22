@@ -65,12 +65,13 @@ subprocess.run(["ketos", "compile", "-f", "path", "-o", "/kaggle/tmp/data/arams_
 # Phase 3.4: Execute CRNN Fine-tuning
 print("Launching ketos train...")
 train_cmd = [
-    "ketos", "train",
+    "ketos",
     "--device", "cuda:0",
     "--precision", "bf16-mixed",
+    "train",
     "-B", "32",
     "--resize", "new",
-    "-i", model_path,
+    "-i", "/kaggle/tmp/models/muharaf_rec_best.mlmodel",
     "-t", "/kaggle/tmp/data/arams_train.arrow",
     "-e", "/kaggle/tmp/data/arams_val.arrow"
 ]
