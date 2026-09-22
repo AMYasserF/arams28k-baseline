@@ -55,7 +55,7 @@ def prepare_split(split_name, output_dir):
 
 print("Writing images and text to disk for Kraken compilation...")
 train_images = prepare_split("train", train_dir)
-val_images = prepare_split("validation", val_dir)
+val_images = prepare_split("val", val_dir)
 
 # Phase 3.3: Binary Dataset Compilation
 print("Compiling Arrow binaries...")

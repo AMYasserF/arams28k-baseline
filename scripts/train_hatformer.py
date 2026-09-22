@@ -97,7 +97,7 @@ def preprocess_function(examples):
 print("Preprocessing dataset...")
 # Due to memory constraints, process on the fly or in small batches
 train_dataset = dataset["train"].map(preprocess_function, batched=True, batch_size=8, remove_columns=dataset["train"].column_names)
-val_dataset = dataset["validation"].map(preprocess_function, batched=True, batch_size=8, remove_columns=dataset["validation"].column_names)
+val_dataset = dataset["val"].map(preprocess_function, batched=True, batch_size=8, remove_columns=dataset["val"].column_names)
 # test_dataset = dataset["test"].map(...)
 
 # Phase 4.3: Configure the Overtraining Loop
