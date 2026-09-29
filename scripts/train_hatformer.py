@@ -128,8 +128,11 @@ def compute_metrics(pred):
     labels_ids = pred.label_ids
     pred_ids = pred.predictions
 
+    # Prevent OverflowError by replacing -100 with pad_token_id
+    pred_ids = np.where(pred_ids != -100, pred_ids, tokenizer.pad_token_id)
+    labels_ids = np.where(labels_ids != -100, labels_ids, tokenizer.pad_token_id)
+
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-    labels_ids[labels_ids == -100] = tokenizer.pad_token_id
     label_str = tokenizer.batch_decode(labels_ids, skip_special_tokens=True)
 
     # JiWER CER with preprocessing
@@ -146,7 +149,11 @@ def compute_metrics(pred):
 
     return {"cer": cer}
 
-from transformers import default_data_collator
+def custom_data_collator(features):
+    pixel_values = torch.stack([torch.tensor(f["pixel_values"]) for f in features])
+    labels = torch.tensor([f["labels"] for f in features])
+    return {"pixel_values": pixel_values, "labels": labels}
+
 trainer = Seq2SeqTrainer(
     model=model,
     processing_class=tokenizer,
@@ -154,7 +161,7 @@ trainer = Seq2SeqTrainer(
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
     compute_metrics=compute_metrics,
-    data_collator=default_data_collator,
+    data_collator=custom_data_collator,
 )
 
 print("Starting HATFormer training...")

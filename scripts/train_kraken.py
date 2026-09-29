@@ -62,6 +62,15 @@ print("Compiling Arrow binaries...")
 subprocess.run(["ketos", "compile", "-f", "path", "-o", "/kaggle/tmp/data/arams_train.arrow"] + train_images, check=True)
 subprocess.run(["ketos", "compile", "-f", "path", "-o", "/kaggle/tmp/data/arams_val.arrow"] + val_images, check=True)
 
+train_manifest = "/kaggle/tmp/data/train_manifest.txt"
+val_manifest = "/kaggle/tmp/data/val_manifest.txt"
+
+with open(train_manifest, "w") as f:
+    f.write("/kaggle/tmp/data/arams_train.arrow\n")
+
+with open(val_manifest, "w") as f:
+    f.write("/kaggle/tmp/data/arams_val.arrow\n")
+
 # Phase 3.4: Execute CRNN Fine-tuning
 print("Launching ketos train...")
 train_cmd = [
@@ -73,8 +82,8 @@ train_cmd = [
     "--resize", "new",
     "-i", "/kaggle/tmp/models/muharaf_rec_best.mlmodel",
     "-f", "binary",
-    "-t", "/kaggle/tmp/data/arams_train.arrow",
-    "-e", "/kaggle/tmp/data/arams_val.arrow"
+    "-t", train_manifest,
+    "-e", val_manifest
 ]
 print("Running command:", " ".join(train_cmd))
 subprocess.run(train_cmd, check=True)
