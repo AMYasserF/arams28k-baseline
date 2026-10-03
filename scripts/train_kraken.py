@@ -82,7 +82,7 @@ train_cmd = [
     "--resize", "new",
     "-i", "/kaggle/tmp/models/muharaf_rec_best.mlmodel",
     "-o", "/kaggle/working/kraken",
-    "--savefreq", "1",
+    "--freq", "1",
     "-f", "binary",
     "-t", train_manifest,
     "-e", val_manifest
