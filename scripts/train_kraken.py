@@ -38,7 +38,9 @@ def prepare_split(split_name, output_dir):
     split_data = dataset[split_name]
     image_paths = []
     for i, item in enumerate(split_data):
-        # Target Transcription Isolation: use text column which contains the normalized text
+        if item.get("line_type") == "margin":
+            continue
+            
         text = item["text"]
         image = item["image"]
         
@@ -78,14 +80,21 @@ train_cmd = [
     "--device", "cuda:0",
     "--precision", "bf16-mixed",
     "train",
-    "-B", "32",
+    "-B", "8",
     "--resize", "new",
+    "--augment",
     "-i", "/kaggle/tmp/models/muharaf_rec_best.mlmodel",
     "-o", "/kaggle/working/kraken",
     "--freq", "1",
     "-f", "binary",
     "-t", train_manifest,
-    "-e", val_manifest
+    "-e", val_manifest,
+    "-r", "0.0005",
+    "--schedule", "cosine",
+    "--freeze-backbone", "19739",
+    "--warmup", "2468",
+    "--lag", "15",
+    "-N", "100"
 ]
 print("Running command:", " ".join(train_cmd))
 subprocess.run(train_cmd, check=True)

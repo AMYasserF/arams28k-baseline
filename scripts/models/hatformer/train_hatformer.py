@@ -165,7 +165,7 @@ def train(cfg, experiment_name):
             (loss / tcfg["grad_accum"]).backward()
 
             if (step + 1) % tcfg["grad_accum"] == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=tcfg.get("grad_clip", 5.0))
                 opt.step()
                 sched.step()
                 opt.zero_grad()

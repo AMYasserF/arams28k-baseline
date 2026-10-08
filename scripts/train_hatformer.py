@@ -96,30 +96,36 @@ def preprocess_function(examples):
 
 print("Preprocessing dataset...")
 # Due to memory constraints, process on the fly or in small batches
-train_dataset = dataset["train"].map(preprocess_function, batched=True, batch_size=8, remove_columns=dataset["train"].column_names)
-val_dataset = dataset["val"].map(preprocess_function, batched=True, batch_size=8, remove_columns=dataset["val"].column_names)
+train_dataset = dataset["train"].filter(lambda x: x.get("line_type", "main") != "margin").map(preprocess_function, batched=True, batch_size=8, remove_columns=dataset["train"].column_names)
+val_dataset = dataset["val"].filter(lambda x: x.get("line_type", "main") != "margin").map(preprocess_function, batched=True, batch_size=8, remove_columns=dataset["val"].column_names)
 # test_dataset = dataset["test"].map(...)
 
 # Phase 4.3: Configure the Overtraining Loop
 training_args = Seq2SeqTrainingArguments(
-    output_dir="/kaggle/working/hatformer_outputs", # Save only final to /kaggle/working
+    output_dir="/kaggle/working/hatformer_outputs",
     per_device_train_batch_size=8,
     per_device_eval_batch_size=8,
     learning_rate=5e-5,
     lr_scheduler_type="linear",
     warmup_steps=500,
     predict_with_generate=True,
-    generation_num_beams=3,
+    generation_num_beams=1,
     generation_config=model.generation_config,
-    save_strategy="epoch",
-    eval_strategy="epoch",
-
-    save_total_limit=1, # Keep only the best
+    save_strategy="steps",
+    eval_strategy="steps",
+    eval_steps=1000,
+    save_steps=1000,
+    max_steps=20000,
+    adam_beta1=0.9,
+    adam_beta2=0.999,
+    adam_epsilon=1e-6,
+    weight_decay=0.01,
+    max_grad_norm=5.0,
+    save_total_limit=1,
     metric_for_best_model="cer",
     greater_is_better=False,
     load_best_model_at_end=True,
-    num_train_epochs=50, # Overtraining strategy
-    dataloader_num_workers=2, # Using file_system sharing strategy
+    dataloader_num_workers=2,
 )
 
 # Custom metrics for CER overtraining strategy

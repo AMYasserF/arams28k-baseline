@@ -14,6 +14,7 @@ os.environ["TRANSFORMERS_CACHE"] = "/kaggle/tmp/hf_cache"
 
 # Load the dataset
 dataset = load_dataset("SubSpring/arams28k-htr-lines", split="test", cache_dir="/kaggle/tmp/hf_cache")
+dataset = dataset.filter(lambda x: x.get("line_type", "main") != "margin")
 
 # Initialize HATFormer Model for Evaluation
 print("Loading HATFormer model and tokenizer for evaluation...")
@@ -85,8 +86,7 @@ for item in dataset:
     with torch.no_grad():
         outputs = model.generate(
             pixel_values, 
-            num_beams=3, 
-            length_penalty=0.5, # Between 0.2 and 0.8
+            num_beams=1, 
             max_length=128
         )
     
