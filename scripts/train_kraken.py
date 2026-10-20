@@ -91,7 +91,7 @@ train_cmd = [
     "-e", val_manifest,
     "-r", "0.0005",
     "--schedule", "cosine",
-    "--freeze-backbone", "19739",
+    "--freeze-backbone", "2468",
     "--warmup", "2468",
     "--lag", "15",
     "-N", "100"
