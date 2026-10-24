@@ -4,9 +4,15 @@ The image pipeline mirrors the original HATFormer preprocessing exactly:
 resize to a fixed height, flip horizontally (Arabic is RTL), then paste into a
 square `canvas`x`canvas` image, stacking lines wider than the canvas as rows.
 Because the canvas is already exactly `canvas` px, the ViT/TrOCR image
-normalization (rescale 1/255, then mean/std 0.5) is applied directly here — this
-is identical to TrOCRProcessor("microsoft/trocr-base-stage1") output and needs
-no network download or local ./trocr folder.
+normalization (rescale 1/255, then mean/std 0.5) is applied directly here.
+
+Changes vs. the original file (behaviour of the model input is unchanged):
+  * image paths are resolved robustly (absolute path, relative to the dataset
+    folder, or by file name inside <dataset>/images) and the dataset FAILS
+    LOUDLY at construction time if images are missing;
+  * labels always end with </s> (added if the tokenizer does not add it), so the
+    decoder learns to stop and greedy decoding cannot run on forever;
+  * optional `main_only` filter (the paper trains on main-text lines only).
 """
 import os
 
@@ -50,15 +56,56 @@ def to_pixel_values(pil_img):
     return torch.from_numpy(np.ascontiguousarray(arr))
 
 
-def load_manifest_split(metadata_csv, split, exclude_books=None):
-    """Filter metadata.csv by split, dropping empty transcriptions."""
+def load_manifest_split(metadata_csv, split, exclude_books=None, books=None, main_only=True):
+    """Filter metadata.csv by split, dropping empty transcriptions (and margin lines)."""
     df = pd.read_csv(metadata_csv)
     df = df[df["split"] == split]
+    if main_only and "line_type" in df.columns:
+        df = df[df["line_type"].fillna("main") == "main"]
     if exclude_books:
         df = df[~df["book_id"].isin(exclude_books)]
+    if books:
+        df = df[df["book_id"].isin(books)]
     df = df.dropna(subset=["img_path", "gt_text"])
     df = df[df["gt_text"].astype(str).str.strip().astype(bool)]
     return df.reset_index(drop=True)
+
+
+def resolve_image_paths(df, root):
+    """Return a list with one existing file path per row, or raise with details."""
+    root = os.path.abspath(root)
+    out, missing = [], []
+    for p in df["img_path"].astype(str):
+        p = p.replace("\\", "/")
+        base = os.path.basename(p)
+        cands = []
+        if os.path.isabs(p):
+            cands.append(p)
+        cands += [os.path.join(root, p), os.path.join(root, "images", base),
+                  os.path.join(os.path.dirname(root), p)]
+        for c in cands:
+            if os.path.isfile(c):
+                out.append(os.path.normpath(c))
+                break
+        else:
+            out.append(None)
+            missing.append(p)
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)}/{len(df)} line images not found under '{root}'.\n"
+            f"  e.g. {missing[:3]}\n"
+            f"  -> check that the AraMS-28k-HTR folder was unzipped and --data-dir points at "
+            f"the folder that contains metadata.csv and images/.")
+    return out
+
+
+def build_labels(tokenizer, text, max_len):
+    """token ids, always terminated by </s>, right-padded with -100 to `max_len`."""
+    ids = tokenizer(str(text), truncation=True, max_length=max_len).input_ids
+    eos = tokenizer.eos_token_id
+    if not ids or ids[-1] != eos:
+        ids = ids[: max_len - 1] + [eos]
+    return ids + [-100] * (max_len - len(ids))
 
 
 class HatformerLineDataset(Dataset):
@@ -68,29 +115,17 @@ class HatformerLineDataset(Dataset):
         self.max_text_length = max_text_length
         self.image_cfg = dict(image_cfg)
         self.root = root
+        self.paths = resolve_image_paths(self.df, root)  # fail early, not at step 3000
+        self.texts = self.df["gt_text"].astype(str).tolist()
 
     def __len__(self):
         return len(self.df)
 
-    def _resolve(self, p):
-        if os.path.isabs(p):
-            return p
-        return os.path.normpath(os.path.join(self.root, p))
-
     def __getitem__(self, i):
-        row = self.df.iloc[i]
-        with Image.open(self._resolve(row["img_path"])) as im:
+        with Image.open(self.paths[i]) as im:
             canvas = hatformer_canvas(im, **self.image_cfg)
         pixel_values = to_pixel_values(canvas)
-
-        ids = self.tokenizer(
-            str(row["gt_text"]),
-            padding="max_length",
-            max_length=self.max_text_length,
-            truncation=True,
-        ).input_ids
-        labels = [t if t != self.tokenizer.pad_token_id else -100 for t in ids]
-
+        labels = build_labels(self.tokenizer, self.texts[i], self.max_text_length)
         return {
             "pixel_values": pixel_values,
             "labels": torch.tensor(labels, dtype=torch.long),

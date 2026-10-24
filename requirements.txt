@@ -1,6 +1,10 @@
-opencv-python
-numpy
+# Kaggle already ships torch / transformers / pandas / matplotlib; this file is for local use.
 torch
+transformers>=4.44
+numpy
 pandas
-yaml
-transformers
+pillow
+pyyaml
+matplotlib
+# only needed by scripts/build_htr_data.py (dataset builder), not for training:
+opencv-python
