@@ -1,220 +1,597 @@
-"""Fine-tune HATFormer on our metadata.csv.
+#!/usr/bin/env python3
+"""Fine-tune HATFormer on AraMS-28k-HTR - Kaggle-ready, resumable, GPU-checked.
 
-Plain-PyTorch trainer (no Lightning) so it runs in the project env as-is and on
-CPU/MPS for smoke tests, while staying GPU-ready. Runs one EXPERIMENT at a time;
-each experiment in the config specifies its own init checkpoint and training data:
-    muharaf_ours : init hatformer-muharaf    + ours   (exp 1)
-    synth_ours   : init hatformer-synthetic  + ours   (exp 2)
+Why this file differs from the original trainer (see docs/KAGGLE_RUN_GUIDE.md):
+  * The model is forced to float32 master weights and trained with fp16 *autocast*
+    + GradScaler.  transformers>=5 loads checkpoints in the dtype they were saved
+    in (float16), and the old loop trained those fp16 weights directly with
+    AdamW(eps=1e-6) -> numerically broken -> loss went UP and predictions were empty.
+  * Full training state (model, AdamW, LR schedule, grad-scaler, RNG, data position,
+    metric history) is checkpointed atomically every `ckpt_every_steps` and when the
+    time budget is reached, so a new Kaggle session continues exactly where the last
+    one stopped.
+  * LR / loss / accuracy / CER curves are written during training.
 
-Usage:
-    python scripts/models/hatformer/train_hatformer.py --experiment muharaf_ours
-    python scripts/models/hatformer/train_hatformer.py --experiment synth_ours --smoke
+Typical use (the notebook does this for you):
+    python train_hatformer.py --experiment muharaf_ours \
+        --data-dir /kaggle/temp/AraMS-28k-HTR --output-dir /kaggle/working/hatformer_run
+    python train_hatformer.py ... --preflight          # 1-minute sanity check
+    python train_hatformer.py ... --eval-only --checkpoint <dir>/best --split test
 """
 import argparse
+import json
 import os
+import random
 import shutil
+import signal
 import sys
+import time
 
+import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader
-from transformers import (
-    PreTrainedTokenizerFast,
-    VisionEncoderDecoderModel,
-    get_inverse_sqrt_schedule,
-)
+from torch.utils.data import DataLoader, Subset
 
-# make `arman` importable whether run as a script or a module
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-from dataset import HatformerLineDataset, load_manifest_split     
-from seed import set_seed 
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from dataset import HatformerLineDataset, load_manifest_split  # noqa: E402
+from hat_utils import (CKPT_META, CKPT_NAME, History, char_error_rate,  # noqa: E402
+                       epoch_batches, exact_match, find_resume_checkpoint, lr_factor,
+                       norm_text, plot_training_curves)
+from seed import set_seed  # noqa: E402
+
+# Paper (AraMS-28k, Table 4) HATFormer test CER, for the final comparison printout.
+PAPER_TEST_CER = {"book_03": 37.88, "book_05": 13.26, "book_09": 25.37, "overall": 26.74}
+BOOK_SCRIPT = {"book_03": "Maghrebi", "book_05": "Ruq'ah", "book_09": "Naskh"}
+EXPECTED_LINES = {"train": 19739, "val": 1486, "test": 6746}
+
+STOP = {"flag": False, "reason": ""}
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")   # avoids 'too many open files' / shm errors
+except Exception:
+    pass
 
 
-def pick_device():
+def log(*a):
+    print(*a, flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# Environment / model
+# --------------------------------------------------------------------------- #
+
+def pick_device(allow_cpu=False):
     if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def _edit_distance(a, b):
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        cur = [i]
-        for j, cb in enumerate(b, 1):
-            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
-        prev = cur
-    return prev[-1]
-
-
-def char_error_rate(preds, refs):
-    tot_e = tot_n = 0
-    for p, r in zip(preds, refs):
-        tot_e += _edit_distance(p, r)
-        tot_n += max(1, len(r))
-    return tot_e / max(1, tot_n)
+        dev = torch.device("cuda")
+        p = torch.cuda.get_device_properties(0)
+        log(f"[GPU] {p.name} | {p.total_memory / 2**30:.1f} GiB | capability {p.major}.{p.minor} "
+            f"| torch {torch.__version__} | cuda {torch.version.cuda}")
+        # Prove kernels really run on this GPU (catches 'no kernel image' on unsupported cards)
+        x = torch.randn(256, 256, device=dev)
+        torch.cuda.synchronize(); _ = (x @ x).sum().item()
+        return dev
+    if allow_cpu:
+        log("[WARN] No GPU - running on CPU (only OK for smoke tests).")
+        return torch.device("cpu")
+    raise RuntimeError(
+        "No CUDA GPU visible to PyTorch. On Kaggle: Notebook sidebar -> Session options -> "
+        "Accelerator -> 'GPU T4 x2' (or P100), then restart the session.")
 
 
 def build_model_and_tokenizer(cfg, init_path, device):
+    from transformers import PreTrainedTokenizerFast, VisionEncoderDecoderModel
+
     tok = PreTrainedTokenizerFast(tokenizer_file=cfg["tokenizer_path"])
-    tok.add_special_tokens({
-        "pad_token": "<pad>", "eos_token": "</s>", "cls_token": "<s>", "bos_token": "<s>",
-    })
-    model = VisionEncoderDecoderModel.from_pretrained(init_path)
-    # match the original HATFormer training recipe (lightning.py): decoder is
-    # teacher-forced starting from <s>, pad aligned to our tokenizer. Generation
-    # still uses the checkpoint's generation_config.json.
-    model.config.decoder_start_token_id = tok.bos_token_id
-    model.config.pad_token_id = tok.pad_token_id
-    model.config.vocab_size = model.config.decoder.vocab_size
+    tok.add_special_tokens({"pad_token": "<pad>", "eos_token": "</s>",
+                            "cls_token": "<s>", "bos_token": "<s>"})
+    try:                                    # transformers >= 4.56 / 5.x
+        model = VisionEncoderDecoderModel.from_pretrained(init_path, dtype=torch.float32)
+    except TypeError:                       # older releases
+        model = VisionEncoderDecoderModel.from_pretrained(init_path, torch_dtype=torch.float32)
+    model = model.float()                   # belt and braces: fp32 master weights, always
+    bad = {str(p.dtype) for p in model.parameters() if p.dtype != torch.float32}
+    assert not bad, f"model still has non-fp32 params: {bad}"
+
+    vocab = model.config.decoder.vocab_size
+    ids = {"bos": tok.bos_token_id, "eos": tok.eos_token_id, "pad": tok.pad_token_id}
+    assert all(v is not None and v < vocab for v in ids.values()), \
+        f"tokenizer special ids {ids} do not fit decoder vocab {vocab} - wrong tokenizer.json?"
+    # match the original HATFormer recipe: decoder starts from <s>, pad aligned to our tokenizer
+    model.config.decoder_start_token_id = ids["bos"]
+    model.config.pad_token_id = ids["pad"]
+    model.config.eos_token_id = ids["eos"]
+    model.config.vocab_size = vocab
+    gc = model.generation_config
+    gc.decoder_start_token_id, gc.pad_token_id, gc.eos_token_id = ids["bos"], ids["pad"], ids["eos"]
     model.to(device)
+    n = sum(p.numel() for p in model.parameters())
+    log(f"[MODEL] {init_path} | {n / 1e6:.1f}M params | fp32 master weights | special ids {ids} | vocab {vocab}")
     return model, tok
 
 
-def make_loaders(cfg, exp, tok):
-    tcfg = cfg["train"]
-    train_df = load_manifest_split(
-        cfg["manifest"], tcfg["split_train"],
-    
-    )
-    val_df = load_manifest_split(
-        cfg["manifest"], tcfg["split_val"]
-    )
-    if cfg.get("_limit"):
-        train_df, val_df = train_df.head(cfg["_limit"]), val_df.head(max(2, cfg["_limit"] // 2))
+def make_datasets(cfg, tok, data_dir, split_names, limit=None):
+    tcfg, dcfg = cfg["train"], cfg["data"]
+    manifest = os.path.join(data_dir, "metadata.csv")
+    common = dict(tokenizer=tok, max_text_length=dcfg["max_text_length"],
+                  image_cfg=cfg["image"], root=data_dir)
+    out = {}
+    for name in split_names:
+        df = load_manifest_split(manifest, tcfg.get(f"split_{name}", name), main_only=dcfg.get("main_only", True))
+        if limit:
+            df = df.head(limit)
+        exp = EXPECTED_LINES.get(name)
+        note = "" if (limit or exp is None or len(df) == exp) else f"  (!! paper release has {exp})"
+        log(f"[DATA] {name:5s}: {len(df):6d} lines, books={sorted(df['book_id'].unique())}{note}")
+        out[name] = (df, HatformerLineDataset(df, **common))
+    return out
 
-    common = dict(tokenizer=tok, max_text_length=cfg["data"]["max_text_length"],
-                  image_cfg=cfg["image"], root=cfg.get("root", "."))
-    train_ds = HatformerLineDataset(train_df, **common)
-    val_ds = HatformerLineDataset(val_df, **common)
-    print(f"  train lines: {len(train_ds)} | val lines: {len(val_ds)}")
 
-    nw = tcfg["num_workers"]
-    train_dl = DataLoader(train_ds, batch_size=tcfg["batch_size"], shuffle=True,
-                          num_workers=nw, persistent_workers=nw > 0, drop_last=False)
-    val_dl = DataLoader(val_ds, batch_size=tcfg["batch_size"], shuffle=False, num_workers=nw,
-                        persistent_workers=nw > 0)
-    return train_dl, val_dl
+# --------------------------------------------------------------------------- #
+# Evaluation
+# --------------------------------------------------------------------------- #
+
+def _loader(ds, bs, nw, shuffle=False):
+    return DataLoader(ds, batch_size=bs, shuffle=shuffle, num_workers=nw,
+                      pin_memory=torch.cuda.is_available(), persistent_workers=False)
+
+
+def _autocast(use_amp):
+    return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp)
 
 
 @torch.no_grad()
-def evaluate(model, tok, val_dl, device, cfg):
+def evaluate(model, tok, ds, device, cfg, use_amp, num_beams=1, max_gen_lines=None,
+             loss_too=True, want_samples=3, books=None):
+    """Teacher-forced loss/token-accuracy on `ds` + generation CER on an evenly
+    spaced subset of `max_gen_lines` lines (all lines if None).
+    Returns a dict (also `per_book` CER if `books` given)."""
     model.eval()
-    tcfg = cfg["train"]
-    losses, preds, refs = [], [], []
-    for bi, batch in enumerate(val_dl):
-        pv = batch["pixel_values"].to(device)
-        labels = batch["labels"].to(device)
-        losses.append(model(pixel_values=pv, labels=labels,
-                            interpolate_pos_encoding=True).loss.item())
-        if bi < tcfg["val_max_batches"]:
-            out = model.generate(pv, num_beams=tcfg["val_num_beams"], length_penalty=0,
-                                 max_new_tokens=cfg["data"]["max_text_length"])
-            gt = labels.clone()
-            gt[gt == -100] = tok.pad_token_id
-            preds += tok.batch_decode(out.tolist(), skip_special_tokens=True)
-            refs += tok.batch_decode(gt.tolist(), skip_special_tokens=True)
+    tcfg, dcfg = cfg["train"], cfg["data"]
+    bs = tcfg.get("eval_batch_size", 32)
+    nw = tcfg["num_workers"]
+    res = {}
+
+    if loss_too:
+        tot_loss = tot_tok = tot_ok = 0.0
+        for batch in _loader(ds, bs, nw):
+            pv = batch["pixel_values"].to(device, non_blocking=True)
+            lab = batch["labels"].to(device, non_blocking=True)
+            with _autocast(use_amp):
+                out = model(pixel_values=pv, labels=lab, interpolate_pos_encoding=True)
+            m = lab != -100
+            n = int(m.sum())
+            tot_loss += float(out.loss) * n
+            tot_ok += int(((out.logits.argmax(-1) == lab) & m).sum())
+            tot_tok += n
+        res["val_loss"] = tot_loss / max(1, tot_tok)
+        res["val_token_acc"] = tot_ok / max(1, tot_tok)
+
+    n = len(ds)
+    idx = list(range(n)) if (max_gen_lines is None or max_gen_lines >= n) \
+        else sorted(set(np.linspace(0, n - 1, max_gen_lines).astype(int).tolist()))
+    gen_ds = ds if len(idx) == n else Subset(ds, idx)
+    texts = [ds.texts[i] for i in idx]
+    book_of = [ds.df.iloc[i]["book_id"] for i in idx] if books else None
+
+    preds = []
+    gen_kw = dict(num_beams=num_beams, max_new_tokens=dcfg["max_text_length"])
+    if num_beams > 1:
+        gen_kw["length_penalty"] = 0.0
+    for batch in _loader(gen_ds, bs, nw):
+        pv = batch["pixel_values"].to(device, non_blocking=True)
+        with _autocast(use_amp):
+            out = model.generate(pv, **gen_kw)
+        preds += tok.batch_decode(out.tolist(), skip_special_tokens=True)
+    refs = [norm_text(t) for t in texts]
+    preds = [norm_text(p) for p in preds]
+    res["val_cer"] = char_error_rate(preds, refs)
+    res["val_char_acc"] = max(0.0, 1.0 - res["val_cer"])
+    res["val_exact_acc"] = exact_match(preds, refs)
+    res["n_gen"] = len(refs)
+    res["empty_pred_frac"] = sum(1 for p in preds if not p) / max(1, len(preds))
+    res["samples"] = list(zip(preds[:want_samples], refs[:want_samples]))
+    if books:
+        pb = {}
+        for b in sorted(set(book_of)):
+            ii = [i for i, bb in enumerate(book_of) if bb == b]
+            pb[b] = {"cer": char_error_rate([preds[i] for i in ii], [refs[i] for i in ii]), "lines": len(ii)}
+        res["per_book"] = pb
+        res["overall_cer"] = res["val_cer"]
     model.train()
-    return sum(losses) / len(losses), char_error_rate(preds, refs), list(zip(preds[:3], refs[:3]))
+    return res
 
 
-def _safe_save(model, tok, path):
-    """Save a checkpoint; on disk-full / any I/O error, warn and KEEP TRAINING
-    instead of crashing, so a full disk doesn't throw away the whole run. Returns
-    True on success; removes the half-written dir so it can't load back corrupt."""
+# --------------------------------------------------------------------------- #
+# Checkpointing
+# --------------------------------------------------------------------------- #
+
+def _disk_free_gb(path):
     try:
-        os.makedirs(path, exist_ok=True)
-        model.save_pretrained(path)
-        tok.save_pretrained(path)
-        return True
-    except OSError as e:
-        shutil.rmtree(path, ignore_errors=True)
-        print(f"  [WARN] checkpoint save failed ({e}). Training continues — "
-              f"free disk space and the next improvement will save.")
+        return shutil.disk_usage(path).free / 2**30
+    except Exception:
+        return 1e9
+
+
+def save_weights_dir(model, tok, path):
+    """HF-format weights (fp32) - used for 'best' and 'last' exports."""
+    tmp = path + ".tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    model.save_pretrained(tmp)
+    tok.save_pretrained(tmp)
+    shutil.rmtree(path, ignore_errors=True)
+    os.replace(tmp, path)
+
+
+def save_training_state(out_dir, model, opt, sched, scaler, st, history, cfg, reason):
+    """Atomic: write ckpt_last.pt.tmp -> os.replace -> sidecar json."""
+    path = os.path.join(out_dir, CKPT_NAME)
+    need = (sum(p.numel() for p in model.parameters()) * 4 * 3) / 2**30 * 1.1
+    if os.path.exists(path):
+        need *= 2          # old ckpt stays on disk until the new one is fully written
+    if _disk_free_gb(out_dir) < need:
+        log(f"  [WARN] only {_disk_free_gb(out_dir):.1f} GiB free, need ~{need:.1f} - skipping checkpoint")
         return False
+    payload = {
+        "model": model.state_dict(), "optimizer": opt.state_dict(),
+        "scheduler": sched.state_dict(), "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+        "step": st["step"], "epoch": st["epoch"], "batch_in_epoch": st["batch_in_epoch"],
+        "best_cer": st["best_cer"], "history": history.records, "cfg": cfg,
+        "rng": {"py": random.getstate(), "np": np.random.get_state(), "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None},
+        "format": 2,
+    }
+    tmp = path + ".tmp"
+    t0 = time.time()
+    try:
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+        with open(os.path.join(out_dir, CKPT_META), "w") as f:
+            json.dump({"step": st["step"], "best_cer": st["best_cer"], "reason": reason,
+                       "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+    except OSError as e:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log(f"  [WARN] checkpoint save failed ({e}); training continues.")
+        return False
+    log(f"  [CKPT] step {st['step']} saved ({reason}) in {time.time() - t0:.0f}s -> {path}")
+    return True
 
 
-def train(cfg, experiment_name):
+def load_training_state(path, model, opt, sched, scaler, st, history):
+    log(f"[RESUME] loading {path}")
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    model.load_state_dict(ck["model"])
+    opt.load_state_dict(ck["optimizer"])
+    sched.load_state_dict(ck["scheduler"])
+    if scaler.is_enabled() and ck.get("scaler"):
+        scaler.load_state_dict(ck["scaler"])
+    st.update(step=ck["step"], epoch=ck["epoch"], batch_in_epoch=ck["batch_in_epoch"], best_cer=ck["best_cer"])
+    history.records = list(ck["history"])
+    try:
+        r = ck["rng"]
+        random.setstate(r["py"]); np.random.set_state(r["np"]); torch.set_rng_state(r["torch"])
+        if r.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(r["cuda"])
+    except Exception as e:
+        log(f"  (rng restore skipped: {e})")
+    log(f"[RESUME] continuing from step {st['step']} (epoch {st['epoch']}, batch {st['batch_in_epoch']}), "
+        f"best CER so far {100 * st['best_cer']:.2f}%")
+    del ck
+
+
+def write_status(out_dir, st, cfg, finished, reason):
+    d = {"finished": finished, "step": st["step"], "max_steps": cfg["train"]["max_steps"],
+         "best_cer": None if st["best_cer"] == float("inf") else st["best_cer"], "reason": reason,
+         "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
+    with open(os.path.join(out_dir, "status.json"), "w") as f:
+        json.dump(d, f, indent=2)
+
+
+# --------------------------------------------------------------------------- #
+# Training
+# --------------------------------------------------------------------------- #
+
+def install_signal_handlers():
+    def _h(signum, _frm):
+        STOP["flag"], STOP["reason"] = True, f"signal {signum}"
+        log(f"\n[SIGNAL] {signum} received - will checkpoint and exit at the next step boundary")
+    for s in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(s, _h)
+        except Exception:
+            pass
+
+
+def print_sample_block(prefix, samples):
+    for p, r in samples:
+        log(f"{prefix}pred: {p}\n{prefix}ref : {r}")
+
+
+def preflight(cfg, args, device):
+    """~1 minute: proves model/tokenizer/data/GPU are wired correctly BEFORE a long run."""
+    use_amp = cfg["train"]["precision"] == "amp_fp16" and device.type == "cuda"
+    exp = cfg["experiments"][args.experiment]
+    model, tok = build_model_and_tokenizer(cfg, cfg["_init_path"], device)
+    d = make_datasets(cfg, tok, args.data_dir, ["train", "val"], limit=args.limit)
+    tr_ds, va_ds = d["train"][1], d["val"][1]
+    s = tr_ds.texts[0]
+    ids = tok(s).input_ids
+    log(f"[TOKENS] text  : {s}\n         ids   : {ids}\n         decode: {tok.decode(ids)}")
+    log(f"         labels: {tr_ds[0]['labels'].tolist()[:len(ids) + 2]}")
+    model.train()
+    b = next(iter(_loader(tr_ds, 8, 0)))
+    pv, lab = b["pixel_values"].to(device), b["labels"].to(device)
+    with torch.no_grad(), _autocast(use_amp):
+        loss = model(pixel_values=pv, labels=lab, interpolate_pos_encoding=True).loss
+    log(f"[CHECK] loss of the *pretrained* init on 8 train lines: {loss.item():.3f} "
+        f"(random-init would be ~{np.log(model.config.decoder.vocab_size):.1f})")
+    r = evaluate(model, tok, va_ds, device, cfg, use_amp, max_gen_lines=16, loss_too=False, want_samples=4)
+    log(f"[CHECK] greedy CER of the pretrained init on 16 val lines: {100 * r['val_cer']:.1f}%  "
+        f"(empty predictions: {100 * r['empty_pred_frac']:.0f}%)")
+    print_sample_block("        ", r["samples"])
+    log("[PREFLIGHT OK] GPU, fp32 weights, tokenizer, data paths and generation all work.")
+
+
+def train(cfg, args, device):
     tcfg = cfg["train"]
     set_seed(tcfg["seed"])
-    device = pick_device()
-    exp = cfg["experiments"][experiment_name]
-    init_path = cfg["checkpoints"][exp["init"]]
-    out_dir = os.path.join(tcfg["output_dir"], experiment_name)
+    out_dir = args.output_dir
     os.makedirs(out_dir, exist_ok=True)
-    print(f"== HATFormer fine-tune | experiment={experiment_name} | device={device} ==")
-    print(f"  init: {exp['init']} ({init_path})  ->  out: {out_dir}")
+    use_amp = tcfg["precision"] == "amp_fp16" and device.type == "cuda"
+    log(f"== HATFormer fine-tune | experiment={args.experiment} | precision={'fp16-autocast+fp32 weights' if use_amp else 'fp32'} "
+        f"| out={out_dir} ==")
 
-    model, tok = build_model_and_tokenizer(cfg, init_path, device)
-    train_dl, val_dl = make_loaders(cfg, exp, tok)
+    model, tok = build_model_and_tokenizer(cfg, cfg["_init_path"], device)
+    d = make_datasets(cfg, tok, args.data_dir, ["train", "val"], limit=args.limit)
+    (_, train_ds), (_, val_ds) = d["train"], d["val"]
 
     opt = torch.optim.AdamW(model.parameters(), lr=tcfg["lr"], betas=tuple(tcfg["betas"]),
                             eps=tcfg["eps"], weight_decay=tcfg["weight_decay"])
-    sched = get_inverse_sqrt_schedule(opt, num_warmup_steps=tcfg["warmup_steps"])
+    kind, warm, max_steps = tcfg["lr_scheduler"], tcfg["warmup_steps"], tcfg["max_steps"]
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_factor(s, warm, kind, max_steps))
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (AttributeError, TypeError):
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    step = 0
-    best_cer = float("inf")
+    st = {"step": 0, "epoch": 0, "batch_in_epoch": 0, "best_cer": float("inf")}
+    history = History()
+
+    if args.resume != "no":
+        roots = [out_dir, "/kaggle/input"] if args.resume == "auto" else [args.resume]
+        skip = ("images", "__pycache__", ".git") + (() if "smoke" in os.path.basename(out_dir.rstrip("/")) else ("smoke_run",))
+        ck = args.resume if (args.resume != "auto" and args.resume.endswith(".pt")) \
+            else find_resume_checkpoint(roots, skip_dirs=skip)
+        if ck:
+            load_training_state(ck, model, opt, sched, scaler, st, history)
+            src_best = os.path.join(os.path.dirname(ck), "best")
+            if os.path.isdir(src_best) and not os.path.isdir(os.path.join(out_dir, "best")):
+                log(f"[RESUME] copying previous best/ model from {src_best}")
+                shutil.copytree(src_best, os.path.join(out_dir, "best"))
+        else:
+            log("[RESUME] no checkpoint found - starting from the pretrained init (step 0)")
+
+    accum, bs = tcfg["grad_accum"], tcfg["batch_size"]
+    n_batches = (len(train_ds) + bs - 1) // bs
+    session_start = float(os.environ.get("SESSION_START_TS", time.time()))
+    deadline = session_start + tcfg["time_budget_hours"] * 3600 if tcfg["time_budget_hours"] else None
+    log(f"[PLAN] {len(train_ds)} train lines | batch {bs} x accum {accum} | {n_batches} batches/epoch | "
+        f"steps {st['step']} -> {max_steps} | lr {tcfg['lr']:.1e} ({kind}, warmup {warm}) | "
+        f"time budget {tcfg['time_budget_hours']} h")
+    install_signal_handlers()
+
     model.train()
-    done = False
+    params = [p for p in model.parameters() if p.requires_grad]
+    done = st["step"] >= max_steps
+    bad_streak = 0
+    t_log, steps_at_log = time.time(), st["step"]
+    acc_loss = torch.zeros((), device=device); acc_ok = torch.zeros((), device=device)
+    acc_tok = torch.zeros((), device=device); acc_n = 0
+    reason = "finished" if done else ""
+    micro = st["batch_in_epoch"]
+
     while not done:
-        for batch in train_dl:
-            pv = batch["pixel_values"].to(device)
-            labels = batch["labels"].to(device)
-            loss = model(pixel_values=pv, labels=labels, interpolate_pos_encoding=True).loss
-            (loss / tcfg["grad_accum"]).backward()
+        batches = epoch_batches(len(train_ds), bs, tcfg["seed"], st["epoch"], st["batch_in_epoch"])
+        if not batches:
+            st["epoch"] += 1; st["batch_in_epoch"] = 0; micro = 0
+            continue
+        loader = DataLoader(train_ds, batch_sampler=batches, num_workers=tcfg["num_workers"],
+                            pin_memory=device.type == "cuda")
+        for batch in loader:
+            pv = batch["pixel_values"].to(device, non_blocking=True)
+            lab = batch["labels"].to(device, non_blocking=True)
+            with _autocast(use_amp):
+                out = model(pixel_values=pv, labels=lab, interpolate_pos_encoding=True)
+            loss = out.loss
+            if not torch.isfinite(loss):
+                bad_streak += 1
+                opt.zero_grad(set_to_none=True)
+                log(f"  [WARN] non-finite loss at step {st['step']} (streak {bad_streak})")
+                if bad_streak >= 25:
+                    raise RuntimeError("25 consecutive non-finite losses - aborting (try precision: fp32)")
+                st["batch_in_epoch"] += 1; micro += 1
+                continue
+            bad_streak = 0
+            scaler.scale(loss / accum).backward()
+            with torch.no_grad():
+                m = lab != -100
+                acc_ok += ((out.logits.argmax(-1) == lab) & m).sum()
+                acc_tok += m.sum()
+                acc_loss += loss.detach(); acc_n += 1
+            st["batch_in_epoch"] += 1; micro += 1
 
-            if (step + 1) % tcfg["grad_accum"] == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=tcfg.get("grad_clip", 5.0))
-                opt.step()
-                sched.step()
-                opt.zero_grad()
+            if micro % accum != 0:
+                continue
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(params, max_norm=tcfg["grad_clip"])
+            scaler.step(opt); scaler.update(); sched.step()
+            opt.zero_grad(set_to_none=True)
+            st["step"] += 1
+            step = st["step"]
 
-            if step % tcfg["log_every_steps"] == 0:
-                print(f"  step {step:>6} | loss {loss.item():.4f} | lr {sched.get_last_lr()[0]:.2e}")
+            if step % tcfg["log_every_steps"] == 0 or step == 1:
+                n = max(1, acc_n)
+                tl, ta = float(acc_loss) / n, float(acc_ok) / max(1.0, float(acc_tok))
+                now = time.time()
+                sps = (now - t_log) / max(1, step - steps_at_log)
+                lr = sched.get_last_lr()[0]
+                history.add("train", step, train_loss=tl, train_token_acc=ta, lr=lr, sec_per_step=sps,
+                            loss_scale=float(scaler.get_scale()) if use_amp else 1.0)
+                eta = (max_steps - step) * sps / 3600
+                mem = torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0
+                log(f"  step {step:>6}/{max_steps} | loss {tl:.4f} | tok-acc {100 * ta:5.1f}% | lr {lr:.2e} | "
+                    f"{sps:.2f}s/step | gpu-mem {mem:.1f}G | ETA {eta:.1f}h")
+                acc_loss.zero_(); acc_ok.zero_(); acc_tok.zero_(); acc_n = 0
+                t_log, steps_at_log = now, step
 
-            if step > 0 and step % tcfg["val_every_steps"] == 0:
-                vloss, vcer, samples = evaluate(model, tok, val_dl, device, cfg)
-                print(f"  [val] step {step} | loss {vloss:.4f} | CER {vcer:.4f}")
-                for p, r in samples:
-                    print(f"        pred: {p}\n        ref : {r}")
-                if vcer < best_cer:
-                    if _safe_save(model, tok, os.path.join(out_dir, "best")):
-                        best_cer = vcer
-                        print(f"  saved best (CER {best_cer:.4f})")
+            if step % tcfg["val_every_steps"] == 0:
+                t0 = time.time()
+                r = evaluate(model, tok, val_ds, device, cfg, use_amp, num_beams=tcfg["val_num_beams"],
+                             max_gen_lines=tcfg["val_max_lines"])
+                history.add("val", step, **{k: r[k] for k in ("val_loss", "val_token_acc", "val_cer",
+                                                              "val_char_acc", "val_exact_acc", "empty_pred_frac")})
+                log(f"  [val] step {step} | loss {r['val_loss']:.4f} | CER {100 * r['val_cer']:.2f}% | "
+                    f"char-acc {100 * r['val_char_acc']:.2f}% | exact-line {100 * r['val_exact_acc']:.1f}% | "
+                    f"tok-acc {100 * r['val_token_acc']:.1f}% | empty {100 * r['empty_pred_frac']:.0f}% | {time.time() - t0:.0f}s")
+                print_sample_block("        ", r["samples"])
+                if r["empty_pred_frac"] > 0.9 and step >= 3000:
+                    log("  [WARN] >90% of validation predictions are EMPTY - training is not working.")
+                if r["val_cer"] < st["best_cer"]:
+                    st["best_cer"] = r["val_cer"]
+                    if _disk_free_gb(out_dir) > 3:
+                        save_weights_dir(model, tok, os.path.join(out_dir, "best"))
+                        with open(os.path.join(out_dir, "best", "best_meta.json"), "w") as f:
+                            json.dump({"step": step, "val_cer": r["val_cer"]}, f)
+                        log(f"  [BEST] new best CER {100 * st['best_cer']:.2f}% -> {out_dir}/best")
+                history.save(out_dir); plot_training_curves(history, os.path.join(out_dir, "plots"))
+                model.train()
 
-            step += 1
-            if step >= tcfg["max_steps"]:
+            if step % tcfg["ckpt_every_steps"] == 0:
+                save_training_state(out_dir, model, opt, sched, scaler, st, history, cfg, "periodic")
+            if step % tcfg["val_every_steps"] == 0 or step % tcfg["ckpt_every_steps"] == 0:
+                t_log, steps_at_log = time.time(), step     # keep s/step & ETA free of val/ckpt time
+
+            if deadline and time.time() > deadline and not STOP["flag"]:
+                STOP["flag"], STOP["reason"] = True, f"time budget {tcfg['time_budget_hours']} h reached"
+            if STOP["flag"]:
+                reason = STOP["reason"]
                 done = True
                 break
+            if step >= max_steps:
+                reason, done = "finished", True
+                break
+        else:
+            st["epoch"] += 1; st["batch_in_epoch"] = 0; micro = 0   # epoch completed normally
 
-    vloss, vcer, _ = evaluate(model, tok, val_dl, device, cfg)
-    print(f"== done | final val loss {vloss:.4f} | CER {vcer:.4f} | best CER {min(best_cer, vcer):.4f} ==")
-    _safe_save(model, tok, os.path.join(out_dir, "last"))
+    finished = st["step"] >= max_steps
+    history.save(out_dir); plot_training_curves(history, os.path.join(out_dir, "plots"))
+    if finished:
+        last = history.records[-1] if history.records else None
+        if last and last["kind"] == "val" and last["step"] == st["step"]:
+            r = last                                   # validation just ran at this very step
+        else:
+            r = evaluate(model, tok, val_ds, device, cfg, use_amp, num_beams=tcfg["val_num_beams"],
+                         max_gen_lines=tcfg["val_max_lines"])
+            history.add("val", st["step"], **{k: r[k] for k in ("val_loss", "val_token_acc", "val_cer",
+                                                                "val_char_acc", "val_exact_acc", "empty_pred_frac")})
+        log(f"== DONE | final val loss {r['val_loss']:.4f} | CER {100 * r['val_cer']:.2f}% | "
+            f"best CER {100 * min(st['best_cer'], r['val_cer']):.2f}% ==")
+        if r["val_cer"] < st["best_cer"]:
+            st["best_cer"] = r["val_cer"]
+            save_weights_dir(model, tok, os.path.join(out_dir, "best"))
+        save_weights_dir(model, tok, os.path.join(out_dir, "last"))
+        history.save(out_dir); plot_training_curves(history, os.path.join(out_dir, "plots"))
+    save_training_state(out_dir, model, opt, sched, scaler, st, history, cfg, reason or "stop")
+    write_status(out_dir, st, cfg, finished, reason)
+    if finished:
+        log("[STATUS] TRAINING COMPLETE.")
+    else:
+        log(f"[STATUS] STOPPED EARLY ({reason}) at step {st['step']}/{max_steps}. "
+            f"Start a new session with this notebook's output attached as input to resume.")
+    return finished
 
+
+def eval_only(cfg, args, device):
+    use_amp = cfg["train"]["precision"] == "amp_fp16" and device.type == "cuda"
+    ckpt = args.checkpoint or os.path.join(args.output_dir, "best")
+    model, tok = build_model_and_tokenizer(cfg, ckpt, device)
+    d = make_datasets(cfg, tok, args.data_dir, [args.split], limit=args.limit)
+    df, ds = d[args.split]
+    t0 = time.time()
+    r = evaluate(model, tok, ds, device, cfg, use_amp, num_beams=args.num_beams, max_gen_lines=None,
+                 loss_too=True, books=True, want_samples=5)
+    log(f"\n== {args.split.upper()} results | checkpoint={ckpt} | beams={args.num_beams} | {time.time() - t0:.0f}s ==")
+    rows = {}
+    for b, v in r["per_book"].items():
+        paper = PAPER_TEST_CER.get(b)
+        rows[b] = {"script": BOOK_SCRIPT.get(b, "?"), "lines": v["lines"], "cer_pct": 100 * v["cer"], "paper_hatformer_cer_pct": paper}
+        log(f"  {b} ({BOOK_SCRIPT.get(b, '?'):9s}) lines={v['lines']:5d}  CER {100 * v['cer']:6.2f}%   paper: {paper}")
+    log(f"  OVERALL CER {100 * r['overall_cer']:.2f}%   (paper HATFormer: {PAPER_TEST_CER['overall']}%)   "
+        f"exact-line acc {100 * r['val_exact_acc']:.1f}%   loss {r['val_loss']:.4f}")
+    print_sample_block("   ", r["samples"])
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, f"{args.split}_results_beams{args.num_beams}.json"), "w", encoding="utf-8") as f:
+        json.dump({"checkpoint": ckpt, "split": args.split, "num_beams": args.num_beams, "per_book": rows,
+                   "overall_cer_pct": 100 * r["overall_cer"], "exact_line_acc": r["val_exact_acc"],
+                   "loss": r["val_loss"], "token_acc": r["val_token_acc"]}, f, indent=2, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------- #
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--experiment", default="muharaf_ours",
-                    choices=["muharaf_ours", "synth_ours", "synth_mix"])
-    ap.add_argument("--config", default="configs/ocr_hatformer.yaml")
+    ap.add_argument("--experiment", default="muharaf_ours", choices=["muharaf_ours", "synth_ours"])
+    ap.add_argument("--config", default=os.path.join(HERE, "..", "..", "..", "configs", "ocr_hatformer.yaml"))
+    ap.add_argument("--data-dir", required=True, help="folder containing metadata.csv and images/")
+    ap.add_argument("--output-dir", required=True, help="where checkpoints/plots/logs go (use /kaggle/working/...)")
+    ap.add_argument("--init-path", help="override: HF folder of the pretrained HATFormer checkpoint")
+    ap.add_argument("--tokenizer", help="override: path to tokenizer.json")
+    ap.add_argument("--resume", default="auto", help="'auto' | 'no' | path to ckpt_last.pt")
     ap.add_argument("--max-steps", type=int)
+    ap.add_argument("--time-budget-hours", type=float)
+    ap.add_argument("--ckpt-every", type=int)
+    ap.add_argument("--val-every", type=int)
+    ap.add_argument("--val-max-lines", type=int)
+    ap.add_argument("--lr", type=float)
+    ap.add_argument("--warmup-steps", type=int)
     ap.add_argument("--batch-size", type=int)
-    ap.add_argument("--smoke", action="store_true",
-                    help="tiny run (few lines, few steps) to validate the loop")
+    ap.add_argument("--grad-accum", type=int)
+    ap.add_argument("--precision", choices=["amp_fp16", "fp32"])
+    ap.add_argument("--limit", type=int, help="use only N lines per split (smoke tests)")
+    ap.add_argument("--preflight", action="store_true", help="sanity-check everything, then exit")
+    ap.add_argument("--eval-only", action="store_true")
+    ap.add_argument("--checkpoint", help="eval-only: HF folder to evaluate (default <output-dir>/best)")
+    ap.add_argument("--split", default="test", choices=["train", "val", "test"])
+    ap.add_argument("--num-beams", type=int, default=1)
+    ap.add_argument("--allow-cpu", action="store_true")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config, encoding="utf-8"))
-    if args.max_steps:
-        cfg["train"]["max_steps"] = args.max_steps
-    if args.batch_size:
-        cfg["train"]["batch_size"] = args.batch_size
-    if args.smoke:
-        cfg["_limit"] = 12
-        cfg["train"].update(max_steps=6, batch_size=2, warmup_steps=2,
-                            val_every_steps=3, val_max_batches=2, log_every_steps=1, num_workers=0)
+    t = cfg["train"]
+    for key, val in (("max_steps", args.max_steps), ("time_budget_hours", args.time_budget_hours),
+                     ("ckpt_every_steps", args.ckpt_every), ("val_every_steps", args.val_every),
+                     ("val_max_lines", args.val_max_lines), ("lr", args.lr), ("precision", args.precision),
+                     ("warmup_steps", args.warmup_steps), ("batch_size", args.batch_size),
+                     ("grad_accum", args.grad_accum)):
+        if val is not None:
+            t[key] = val
+    if args.tokenizer:
+        cfg["tokenizer_path"] = args.tokenizer
+    exp = cfg["experiments"][args.experiment]
+    cfg["_init_path"] = args.init_path or cfg["checkpoints"][exp["init"]]
 
-    train(cfg, args.experiment)
+    device = pick_device(args.allow_cpu)
+    log(f"[CFG] lr={t['lr']} betas={t['betas']} eps={t['eps']} wd={t['weight_decay']} bs={t['batch_size']} "
+        f"warmup={t['warmup_steps']} clip={t['grad_clip']} max_steps={t['max_steps']} sched={t['lr_scheduler']} "
+        f"precision={t['precision']}")
+    if args.preflight:
+        preflight(cfg, args, device)
+    elif args.eval_only:
+        eval_only(cfg, args, device)
+    else:
+        train(cfg, args, device)
 
 
 if __name__ == "__main__":

@@ -1,61 +1,56 @@
-# HATFormer fine-tuning — two experiments:
-#   init checkpoint  (synthetic   vs   synthetic+Muharaf)
+# HATFormer fine-tuning on AraMS-28k-HTR  (values = paper Appendix B.1 unless marked [assumption])
 #
-#   exp 1  muharaf_ours : init hatformer-muharaf    + fine-tune on ours
-#   exp 2  synth_ours   : init hatformer-synthetic  + fine-tune on ours
-#
-#   exp1 vs exp2 -> does the Muharaf pretraining help? (same data, diff init)
-# All two are evaluated on the SAME held-out OUR split so CER is comparable.
+#   exp 1  muharaf_ours : init hatformer-muharaf    + fine-tune on ours   <- the paper's baseline
+#   exp 2  synth_ours   : init hatformer-synthetic  + fine-tune on ours   (ablation: no Muharaf stage)
 
-tokenizer_path: scripts/models/hatformer/tokenizer/tokenizer.json # 50,265-tok Arabic BBPE
-manifest: AraMS-28k-HTR/metadata.csv
-root: "." # image_path values resolved against this
+tokenizer_path: scripts/models/hatformer/tokenizer/tokenizer.json   # 50,265-token Arabic BBPE
 
-# Available init checkpoints (architecturally identical: ViT-384 + TrOCR-large, vocab 50265).
+# default init locations (the Kaggle notebook overrides these with --init-path / --tokenizer)
 checkpoints:
   synthetic: checkpoints/hatformer/original/hatformer-synthetic
   muharaf: checkpoints/hatformer/original/hatformer-muharaf
 
-# HATFormer line-image preprocessing (must match training AND inference):
-# resize to fixed height, flip RTL, paste into a square canvas. Canvas is exactly
-# `canvas` px so ViT normalization (mean/std 0.5) is applied directly — no ./trocr.
+# HATFormer line preprocessing (must match training AND inference):
+# resize to height 64, flip RTL, paste into a 384x384 canvas (long lines wrap into rows).
 image:
   height: 64
   canvas: 384
   rtl_flip: true
 
 data:
-  max_text_length: 64 # our lines top out at ~33 tokens (orig default was 490)
+  max_text_length: 64     # our lines top out at ~33 tokens (original default was 490)
+  main_only: true         # paper: recognition experiments use main-text lines only
 
-# The two experiments. `init` keys into `checkpoints` above. `train_sources` /
-# `val_sources` filter manifest rows by source_dataset; mix needs the external
-# corpora ingested into the manifest first (currently only `ours` exists).
 experiments:
-  muharaf_ours: # exp 1
+  muharaf_ours:
     init: muharaf
-    train_sources: [ours]
-    val_sources: [ours]
-  synth_ours: # exp 2
+  synth_ours:
     init: synthetic
-    train_sources: [ours]
-    val_sources: [ours]
 
 train:
   split_train: train
   split_val: val
+  # ---- paper hyper-parameters -------------------------------------------------
   batch_size: 8
   grad_accum: 1
-  lr: 5.0e-5 # fine-tune LR (orig from-scratch was 1e-4)
+  lr: 5.0e-5                 # fine-tune LR (paper: half an order of magnitude below from-scratch)
   weight_decay: 0.01
   betas: [0.9, 0.999]
   eps: 1.0e-6
-  warmup_steps: 500
+  warmup_steps: 500          # linear warm-up
   max_steps: 20000
   grad_clip: 5.0
-  val_every_steps: 1000
-  val_max_batches: 32 # cap val batches used for CER (generate is slow)
-  val_num_beams: 1 # greedy during training-val; use beams at final eval
+  val_every_steps: 1000      # paper: checkpoint every 1,000 steps, select by val CER (greedy)
+  val_num_beams: 1           # greedy during training-time validation
+  seed: 1337
+  # ---- not specified in the paper ----------------------------------------------
+  lr_scheduler: inverse_sqrt # [assumption] decay after warm-up; same as the repo / original HATFormer
+                             # options: inverse_sqrt | linear | cosine | constant
+  val_max_lines: 256         # CER is computed on 256 evenly-spaced val lines (loss uses all 1,486)
+  eval_batch_size: 32
   log_every_steps: 50
   num_workers: 4
-  seed: 1337
-  output_dir: checkpoints/hatformer/ours/ # checkpoints saved to <output_dir>/<experiment>/
+  # ---- Kaggle / robustness ------------------------------------------------------
+  precision: amp_fp16        # fp32 master weights + fp16 autocast + GradScaler. (fp32 = slower, same maths)
+  ckpt_every_steps: 1000     # full resumable state (model+AdamW+schedule+RNG+data position)
+  time_budget_hours: 11.0    # stop cleanly + checkpoint before Kaggle's 12 h wall (0 = disabled)
