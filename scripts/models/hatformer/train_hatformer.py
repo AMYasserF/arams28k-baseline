@@ -27,7 +27,9 @@ import signal
 import sys
 import time
 
+from pathlib import Path
 import numpy as np
+import pandas as pd
 import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
@@ -36,8 +38,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from dataset import HatformerLineDataset, load_manifest_split  # noqa: E402
 from hat_utils import (CKPT_META, CKPT_NAME, History, char_error_rate,  # noqa: E402
-                       epoch_batches, exact_match, find_resume_checkpoint, lr_factor,
-                       norm_text, plot_training_curves)
+                       edit_distance, epoch_batches, exact_match, find_resume_checkpoint,
+                       lr_factor, norm_text, plot_training_curves)
 from seed import set_seed  # noqa: E402
 
 # Paper (AraMS-28k, Table 4) HATFormer test CER, for the final comparison printout.
@@ -142,7 +144,7 @@ def _autocast(use_amp):
 
 @torch.no_grad()
 def evaluate(model, tok, ds, device, cfg, use_amp, num_beams=1, max_gen_lines=None,
-             loss_too=True, want_samples=3, books=None):
+             loss_too=True, want_samples=3, books=None, return_preds=False):
     """Teacher-forced loss/token-accuracy on `ds` + generation CER on an evenly
     spaced subset of `max_gen_lines` lines (all lines if None).
     Returns a dict (also `per_book` CER if `books` given)."""
@@ -198,6 +200,10 @@ def evaluate(model, tok, ds, device, cfg, use_amp, num_beams=1, max_gen_lines=No
             pb[b] = {"cer": char_error_rate([preds[i] for i in ii], [refs[i] for i in ii]), "lines": len(ii)}
         res["per_book"] = pb
         res["overall_cer"] = res["val_cer"]
+    if return_preds:
+        res["preds"] = preds
+        res["refs"] = refs
+        res["idx"] = idx
     model.train()
     return res
 
@@ -513,6 +519,145 @@ def train(cfg, args, device):
     return finished
 
 
+def export_prediction_csvs(df, ds, preds, gen_indices, save_preds_dir, data_dir,
+                           split="test", num_beams=1, ckpt="", trainer_results=None):
+    """Export per-book prediction CSVs in exact 1-to-1 schema compatibility with Kraken EDA.
+    Outputs:
+      - <save_preds_dir>/hatformer_preds_book_03.csv (Maghrebi)
+      - <save_preds_dir>/hatformer_preds_book_05.csv (Ruq'ah)
+      - <save_preds_dir>/hatformer_preds_book_09.csv (Naskh)
+      - <save_preds_dir>/eval_summary.json
+    """
+    os.makedirs(save_preds_dir, exist_ok=True)
+
+    # 1. Build stem-to-global-index mapping for exact line_uid alignment with test_manifest / Kraken
+    manifest_file = os.path.join(data_dir, "test_manifest.txt")
+    stem_to_idx = {}
+    if os.path.isfile(manifest_file):
+        with open(manifest_file, encoding="utf-8") as f:
+            stems = [Path(line.strip().replace("\\", "/")).stem for line in f if line.strip()]
+        stem_to_idx = {stem: i for i, stem in enumerate(stems)}
+    else:
+        meta_file = os.path.join(data_dir, "metadata.csv")
+        if os.path.isfile(meta_file):
+            meta_full = pd.read_csv(meta_file)
+            test_meta = meta_full[meta_full["split"] == "test"]
+            if "line_type" in test_meta.columns:
+                test_meta = test_meta[test_meta["line_type"].fillna("main") == "main"]
+            stem_to_idx = {Path(str(p).replace("\\", "/")).stem: i for i, p in enumerate(test_meta["img_path"])}
+
+    records = []
+    for k, idx_val in enumerate(gen_indices):
+        row = df.iloc[idx_val]
+        img_p = str(row.get("img_path", ""))
+        stem = Path(img_p.replace("\\", "/")).stem
+        book_id = str(row.get("book_id", ""))
+
+        global_idx = stem_to_idx.get(stem, idx_val)
+        line_uid = f"{book_id}_line_{global_idx:06d}"
+
+        gt_raw = str(row.get("gt_text", ""))
+        gt_norm = norm_text(gt_raw)
+
+        pred_val = preds[k]
+        pred_norm = norm_text(pred_val) if pred_val is not None else ""
+        if not pred_norm:
+            pred_norm = ""
+
+        records.append({
+            "line_uid": line_uid,
+            "book_id": book_id,
+            "image_stem": stem,
+            "gt_normalized": gt_norm,
+            "hatformer_pred": pred_norm,
+        })
+
+    res_df = pd.DataFrame(records)
+
+    summary = {
+        "checkpoint": ckpt,
+        "split": split,
+        "num_beams": num_beams,
+        "export_dir": os.path.abspath(save_preds_dir),
+        "overall": {},
+        "per_book": {}
+    }
+
+    log("\n" + "=" * 68)
+    log(f"  [EXPORT] WRITING PER-BOOK PREDICTION CSVS -> {save_preds_dir}")
+    log("=" * 68)
+
+    tot_edits = 0
+    tot_chars = 0
+    tot_cer_sum = 0.0
+    tot_lines = len(res_df)
+
+    books_present = sorted(res_df["book_id"].unique())
+    for b_id in books_present:
+        b_df = res_df[res_df["book_id"] == b_id].copy()
+
+        b_edits = sum(edit_distance(p, r) for p, r in zip(b_df["hatformer_pred"], b_df["gt_normalized"]))
+        b_chars = sum(max(1, len(r)) for r in b_df["gt_normalized"])
+        b_line_cers = [edit_distance(p, r) / max(1, len(r)) for p, r in zip(b_df["hatformer_pred"], b_df["gt_normalized"])]
+
+        b_corpus_cer = b_edits / max(1, b_chars) if b_chars > 0 else 0.0
+        b_mean_cer = sum(b_line_cers) / max(1, len(b_line_cers)) if b_line_cers else 0.0
+
+        tot_edits += b_edits
+        tot_chars += b_chars
+        tot_cer_sum += sum(b_line_cers)
+
+        csv_filename = f"hatformer_preds_{b_id}.csv"
+        csv_path = os.path.join(save_preds_dir, csv_filename)
+        b_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+        script_name = BOOK_SCRIPT.get(b_id, b_id)
+        log(f"  {b_id} ({script_name:9s}): {len(b_df):5d} lines | "
+            f"Corpus CER: {100 * b_corpus_cer:6.2f}% | Mean CER: {100 * b_mean_cer:6.2f}% -> {csv_filename}")
+
+        summary["per_book"][b_id] = {
+            "script": script_name,
+            "lines": len(b_df),
+            "csv_file": csv_filename,
+            "corpus_cer": float(b_corpus_cer),
+            "corpus_cer_pct": round(float(100 * b_corpus_cer), 4),
+            "mean_cer": float(b_mean_cer),
+            "mean_cer_pct": round(float(100 * b_mean_cer), 4),
+        }
+        if trainer_results and "per_book" in trainer_results and b_id in trainer_results["per_book"]:
+            summary["per_book"][b_id]["trainer_cer_pct"] = round(float(100 * trainer_results["per_book"][b_id]["cer"]), 4)
+
+    overall_corpus_cer = tot_edits / max(1, tot_chars) if tot_chars > 0 else 0.0
+    overall_mean_cer = tot_cer_sum / max(1, tot_lines) if tot_lines > 0 else 0.0
+    macro_mean_cer = sum(b["mean_cer"] for b in summary["per_book"].values()) / max(1, len(summary["per_book"])) if summary["per_book"] else 0.0
+    macro_corpus_cer = sum(b["corpus_cer"] for b in summary["per_book"].values()) / max(1, len(summary["per_book"])) if summary["per_book"] else 0.0
+
+    log(f"  OVERALL          : {tot_lines:5d} lines | "
+        f"Corpus CER: {100 * overall_corpus_cer:6.2f}% | Mean CER: {100 * overall_mean_cer:6.2f}% | "
+        f"Macro CER: {100 * macro_corpus_cer:6.2f}%")
+
+    summary["overall"] = {
+        "lines": tot_lines,
+        "corpus_cer": float(overall_corpus_cer),
+        "corpus_cer_pct": round(float(100 * overall_corpus_cer), 4),
+        "mean_cer": float(overall_mean_cer),
+        "mean_cer_pct": round(float(100 * overall_mean_cer), 4),
+        "macro_mean_cer": float(macro_mean_cer),
+        "macro_mean_cer_pct": round(float(100 * macro_mean_cer), 4),
+        "macro_corpus_cer": float(macro_corpus_cer),
+        "macro_corpus_cer_pct": round(float(100 * macro_corpus_cer), 4),
+    }
+    if trainer_results and "overall_cer" in trainer_results:
+        summary["overall"]["trainer_cer_pct"] = round(float(100 * trainer_results["overall_cer"]), 4)
+
+    summary_path = os.path.join(save_preds_dir, "eval_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    log(f"  [EXPORT] Saved verification summary -> {summary_path}")
+    log("=" * 68 + "\n")
+    return summary
+
+
 def eval_only(cfg, args, device):
     use_amp = cfg["train"]["precision"] == "amp_fp16" and device.type == "cuda"
     ckpt = args.checkpoint or os.path.join(args.output_dir, "best")
@@ -520,8 +665,9 @@ def eval_only(cfg, args, device):
     d = make_datasets(cfg, tok, args.data_dir, [args.split], limit=args.limit)
     df, ds = d[args.split]
     t0 = time.time()
+    want_preds = bool(args.save_preds_dir)
     r = evaluate(model, tok, ds, device, cfg, use_amp, num_beams=args.num_beams, max_gen_lines=None,
-                 loss_too=True, books=True, want_samples=5)
+                 loss_too=True, books=True, want_samples=5, return_preds=want_preds)
     log(f"\n== {args.split.upper()} results | checkpoint={ckpt} | beams={args.num_beams} | {time.time() - t0:.0f}s ==")
     rows = {}
     for b, v in r["per_book"].items():
@@ -536,6 +682,13 @@ def eval_only(cfg, args, device):
         json.dump({"checkpoint": ckpt, "split": args.split, "num_beams": args.num_beams, "per_book": rows,
                    "overall_cer_pct": 100 * r["overall_cer"], "exact_line_acc": r["val_exact_acc"],
                    "loss": r["val_loss"], "token_acc": r["val_token_acc"]}, f, indent=2, ensure_ascii=False)
+    if args.save_preds_dir:
+        export_prediction_csvs(
+            df=df, ds=ds, preds=r["preds"], gen_indices=r["idx"],
+            save_preds_dir=args.save_preds_dir, data_dir=args.data_dir,
+            split=args.split, num_beams=args.num_beams, ckpt=ckpt,
+            trainer_results=r
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -565,6 +718,7 @@ def main():
     ap.add_argument("--checkpoint", help="eval-only: HF folder to evaluate (default <output-dir>/best)")
     ap.add_argument("--split", default="test", choices=["train", "val", "test"])
     ap.add_argument("--num-beams", type=int, default=1)
+    ap.add_argument("--save-preds-dir", help="export per-book prediction CSVs and eval_summary.json to this folder")
     ap.add_argument("--allow-cpu", action="store_true")
     args = ap.parse_args()
 
