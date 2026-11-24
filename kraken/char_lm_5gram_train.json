@@ -1,0 +1,17 @@
+{
+  "order": 5,
+  "num_train_lines": 19739,
+  "num_train_chars": 1187789,
+  "vocab_size": 37,
+  "use_eos": false,
+  "ngram_counts": {
+    "1": 37,
+    "2": 1021,
+    "3": 12806,
+    "4": 63852,
+    "5": 175766
+  },
+  "train_sec": 3.37,
+  "train_sample_ppl": 4.512,
+  "val_ppl_diagnostic": 7.4007
+}

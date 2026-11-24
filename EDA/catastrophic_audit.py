@@ -80,7 +80,7 @@ def wer_line(ref: str, hyp: str) -> float:
     ref_w = ref.split(); hyp_w = hyp.split()
     if not ref_w:
         return 0.0
-    return LevDist.distance(" ".join(ref_w), " ".join(hyp_w)) / len(ref.split())
+    return LevDist.distance(ref_w, hyp_w) / len(ref_w)
 
 
 def decompose_edits(ref: str, hyp: str):

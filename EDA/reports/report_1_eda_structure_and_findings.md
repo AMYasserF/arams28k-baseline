@@ -29,9 +29,9 @@ Establish an unambiguous, reproducible baseline for all downstream comparisons. 
 
 | Book | Script | Lines | GT Chars | Mean CER | Corpus CER | Median CER | Mean WER | P90 CER |
 |------|--------|------:|--------:|:-------:|:---------:|:---------:|:-------:|:-------:|
-| book_03 | Maghrebi | 3,661 | 185,807 | 32.09% | 30.85% | 30.00% | 160.6% | 45.10% |
-| book_05 | Ruq'ah | 2,027 | 145,129 | 11.51% | 11.25% | 8.97% | 59.6% | 19.68% |
-| book_09 | Naskh | 1,056 | 81,371 | 22.69% | 22.11% | 19.73% | 115.3% | 33.81% |
+| book_03 | Maghrebi | 3,661 | 185,807 | 32.09% | 30.85% | 30.00% | 77.42% | 45.10% |
+| book_05 | Ruq'ah | 2,027 | 145,129 | 11.51% | 11.25% | 8.97% | 39.01% | 19.68% |
+| book_09 | Naskh | 1,056 | 81,371 | 22.69% | 22.11% | 19.73% | 59.41% | 33.81% |
 
 > [!NOTE]
 > Mean CER and Corpus CER are within ~1.5% of each other for all scripts, confirming that line-length does not introduce systematic bias into the per-line averages. Both metrics are valid to report.
@@ -210,9 +210,9 @@ Complement CER with WER to detect word-boundary errors — specifically hallucin
 - WER scatter against word count to test dependency
 
 ### Findings
-- **Maghrebi mean WER = 160.6%** — the model's word-sequence output is so distorted it cannot be aligned to GT without over 1.6x as many edits as GT words. This is not a CER-level problem; it's a word-structure failure.
-- **Naskh mean WER = 115.3%** — similar pathology, confirming both scripts suffer from word-level hallucination.
-- **Ruq'ah mean WER = 59.6%** — still high in absolute terms, but tractable.
+- **Maghrebi mean WER = 77.4% (Corpus WER = 75.6%)** — the model's word-level error rate is elevated, driven by ligature and character substitutions corrupting token identities.
+- **Naskh mean WER = 59.4% (Corpus WER = 58.3%)** — intermediate word-level distortion, tracking character error rate.
+- **Ruq'ah mean WER = 39.0% (Corpus WER = 38.3%)** — lowest error rate, with over 60% of words correctly identified without post-processing.
 - WER-vs-word-count scatter shows positive correlation for all scripts: more words per line = more opportunity for alignment failures.
 
 **Figure:** `figures/13_wer_analysis.png`

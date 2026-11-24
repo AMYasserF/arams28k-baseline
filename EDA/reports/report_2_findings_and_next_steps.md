@@ -65,10 +65,11 @@ The low CER despite high deletion rate also means the *remaining* characters (af
 
 ---
 
-## Finding 4 — WER > 100% Proves Word-Boundary Hallucination
+## Finding 4 — Word Error Rate Reveals Word-Boundary and Token Corruption
 
 ### What the data says
-Maghrebi mean WER = **160.6%**, Naskh mean WER = **115.3%**. These values exceed 100%, which is only possible when the hypothesis sequence is so distorted it cannot be aligned to GT without more edits than there are GT words.
+Maghrebi mean WER = **77.4%** (Corpus WER = **75.6%**), Naskh mean WER = **59.4%** (Corpus WER = **58.3%**), and Ruq'ah mean WER = **39.0%** (Corpus WER = **38.3%**).
+*(Note: A previous calculation artifact computed character-level distance across word sequences; true word-level Levenshtein distance confirms that over 3 out of 4 words in Maghrebi suffer from corruption, whereas over 60% of words in Ruq'ah are correctly transcribed.)*
 
 ### What this means
 Kraken is not just mis-reading individual characters — it is **breaking the word structure** of Maghrebi and Naskh text. This manifests as:
@@ -79,7 +80,7 @@ Kraken is not just mis-reading individual characters — it is **breaking the wo
 
 This is distinct from character-level confusion and cannot be detected or fixed at the character level. It requires a **word-aware correction model** — specifically a language model that understands what valid Arabic word sequences look like.
 
-The CER metric alone would *never* surface this problem. WER > 100% is an emergency signal.
+The CER metric alone would *never* surface this problem. Severe word-level error is an emergency signal.
 
 ### What this means for your paper
 This is your **strongest empirical justification for LLM post-processing**. The argument becomes: "Character-level correction is insufficient because word boundaries themselves are corrupted. We require a contextual language model to restore word-level coherence." You have the numbers to prove it.
@@ -168,7 +169,7 @@ Ruq'ah has a **tractable, recoverable error profile**. The good/near-perfect tie
 This contrasts sharply with Maghrebi where the input to any post-processor is fundamentally corrupted — the LLM would be doing reconstruction, not correction.
 
 ### Next step
-> **Ruq'ah should be the first LLM post-processing pilot.** Use the 2,027 Ruq'ah lines as your post-processing development set. The expected WER improvement will be the highest (starting from 59.6% with mostly-intact word structure) and the results will be interpretable. Maghrebi should be the *challenge* target, introduced after the pipeline is proven on Ruq'ah.
+> **Ruq'ah should be the first LLM post-processing pilot.** Use the 2,027 Ruq'ah lines as your post-processing development set. The expected WER improvement will be the highest (starting from 39.0% with mostly-intact word structure) and the results will be interpretable. Maghrebi should be the *challenge* target, introduced after the pipeline is proven on Ruq'ah.
 
 ---
 
@@ -184,7 +185,7 @@ Ruq'ah deletion dominance           -> CTC blank penalty tuning
                                        Input resolution upscaling
                                        Diacritic-aware augmentation
 
-WER > 100% (word boundary collapse) -> LLM zero-shot post-processing
+High WER (word boundary & token corruption) -> LLM zero-shot post-processing
                                        (restore word structure semantically)
 
 N-gram escalation (ligature cascade)-> Script-specific fine-tuning

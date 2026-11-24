@@ -1,0 +1,50 @@
+{
+  "checkpoint": "/kaggle/working/hatformer_run/best",
+  "split": "test",
+  "num_beams": 1,
+  "export_dir": "/kaggle/working/hatformer_run/predictions_beams1",
+  "overall": {
+    "lines": 6744,
+    "corpus_cer": 0.2601241308054435,
+    "corpus_cer_pct": 26.0124,
+    "mean_cer": 0.3033841816887406,
+    "mean_cer_pct": 30.3384,
+    "macro_mean_cer": 0.27149626398946175,
+    "macro_mean_cer_pct": 27.1496,
+    "macro_corpus_cer": 0.24691873236433978,
+    "macro_corpus_cer_pct": 24.6919,
+    "trainer_cer_pct": 26.0124
+  },
+  "per_book": {
+    "book_03": {
+      "script": "Maghrebi",
+      "lines": 3661,
+      "csv_file": "hatformer_preds_book_03.csv",
+      "corpus_cer": 0.37550791950787643,
+      "corpus_cer_pct": 37.5508,
+      "mean_cer": 0.39121470706450623,
+      "mean_cer_pct": 39.1215,
+      "trainer_cer_pct": 37.5508
+    },
+    "book_05": {
+      "script": "Ruq'ah",
+      "lines": 2027,
+      "csv_file": "hatformer_preds_book_05.csv",
+      "corpus_cer": 0.12168484589572036,
+      "corpus_cer_pct": 12.1685,
+      "mean_cer": 0.17179036569228923,
+      "mean_cer_pct": 17.179,
+      "trainer_cer_pct": 12.1685
+    },
+    "book_09": {
+      "script": "Naskh",
+      "lines": 1056,
+      "csv_file": "hatformer_preds_book_09.csv",
+      "corpus_cer": 0.24356343168942252,
+      "corpus_cer_pct": 24.3563,
+      "mean_cer": 0.25148371921158985,
+      "mean_cer_pct": 25.1484,
+      "trainer_cer_pct": 24.3563
+    }
+  }
+}
