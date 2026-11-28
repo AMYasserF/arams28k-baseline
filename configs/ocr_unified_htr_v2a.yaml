@@ -1,0 +1,73 @@
+# Unified V2a: HTR Visual Augmentation + Feature Regularization + Unsupervised FiLM
+#
+# Preserves strict benchmark fairness vs V1 and baseline HATFormer:
+#   - Official splits untouched (train=19,739, val=1,486, test=6,744)
+#   - exclude_corrupt_train: false, p_blank: 0.0
+#   - Decoder initialized cleanly from pre-AraMS `hatformer-muharaf` TrOCRForCausalLM
+
+tokenizer_path: scripts/models/hatformer/tokenizer/tokenizer.json   # 50,265-token Arabic BBPE
+
+checkpoints:
+  muharaf: checkpoints/hatformer/original/hatformer-muharaf
+
+image:
+  height: 64
+  min_width: 16
+  max_width: 1280
+  rtl_flip: true
+
+data:
+  max_text_length: 64
+  main_only: true
+  exclude_corrupt_train: false   # STRICT: preserve all 19,739 official train lines
+  p_blank: 0.0                   # STRICT: disabled
+  augment_train: true            # Train-only manuscript visual augmentations
+
+model:
+  use_multiscale: true
+  use_film: true
+  use_ctc: true
+  use_script_loss: false         # Unsupervised FiLM (prevents training-book memorization)
+  film_dropout: 0.35
+  spec_aug_prob: 0.5
+  spec_aug_num_masks: 2
+  spec_aug_max_ratio: 0.08
+  enc_feat_dropout: 0.15
+  context_dropout: 0.15
+  label_smoothing: 0.10
+  lambda_ctc: 0.30
+  alpha_script: 0.0
+  pretrained_backbone: true
+
+train:
+  split_train: train
+  split_val: val
+  seed: 1337
+  batch_size: 8
+  grad_accum: 1
+  weight_decay: 0.02
+  betas: [0.9, 0.999]
+  eps: 1.0e-6
+  grad_clip: 5.0
+  max_steps: 30000
+
+  # Stage 1: train vision/FiLM/BiLSTM/CTC encoder with TrOCR decoder frozen
+  stage1_steps: 4000
+  stage1_lr: 3.0e-4
+  stage1_warmup: 400
+
+  # Stage 2: unfreeze TrOCR decoder with differential cosine LRs down to min_lr
+  stage2_encoder_lr: 1.0e-4
+  stage2_decoder_lr: 5.0e-5
+  stage2_warmup: 600
+  min_lr: 1.0e-6
+
+  val_every_steps: 1000
+  ckpt_every_steps: 1000
+  val_max_lines: 256
+  val_num_beams: 1
+  eval_batch_size: 32
+  log_every_steps: 50
+  num_workers: 4
+  precision: amp_fp16
+  time_budget_hours: 11.0

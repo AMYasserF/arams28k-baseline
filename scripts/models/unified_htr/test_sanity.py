@@ -392,6 +392,125 @@ def main() -> int:
         tiny_model.decoder.model.decoder.layers[0].encoder_attn = orig_enc_attn
 
     print("[PASS 4E] generate() verified on B={1,4,8}, non-%4 widths, val B=8 linspace (W=736), & EncoderDecoderCache")
+
+    # ── 4F. V2a Visual Augmentation, SpecAugment, Label Smoothing & Notebook Validation ──
+    import random as _py_random
+    import torch.nn.functional as _F
+    from PIL import Image as _PIL_Image
+    from dataset import preprocess_ink_3ch  # noqa: E402
+    from model import TROCR_PAD_ID, shift_tokens_right  # noqa: E402
+
+    # 1) Train-only augmentation guard & bounded finite outputs on mixed scripts + 2x2 degenerate crop
+    ds_aug = UnifiedHTRDataset(data_dir=data_dir, split="train", tokenizer=tok, ctc_vocab=vocab, augment=True)
+    ds_val_aug = UnifiedHTRDataset(data_dir=data_dir, split="val", tokenizer=tok, ctc_vocab=vocab, augment=True, limit=16)
+    assert ds_aug.augment is True and ds_val_aug.augment is False, "Augmentation must be train-only!"
+
+    # Deterministic check when augment=False
+    for i_det in (idx_maghrebi, idx_ruqah, idx_litho, idx_corrupt_2x2):
+        assert torch.equal(ds[i_det]["pixel_values"], ds[i_det]["pixel_values"])
+
+    # Repeated augmented pulls across real mixed-script lines & 2x2 dummy crop
+    for _trial in range(3):
+        for i_aug in (idx_maghrebi, idx_ruqah, idx_litho, idx_corrupt_2x2):
+            pv_aug = ds_aug[i_aug]["pixel_values"]
+            assert pv_aug.ndim == 3 and pv_aug.shape[0] == 3 and pv_aug.shape[1] == 64
+            assert 16 <= pv_aug.shape[2] <= 1280 and pv_aug.shape[2] % 4 == 0
+            assert torch.isfinite(pv_aug).all(), f"Non-finite augmented pixel_values for idx={i_aug}"
+            assert float(pv_aug.min()) >= 0.0 and float(pv_aug.max()) <= 1.0
+
+    # Verify augment=True actually perturbs real grayscale line crop while augment=False is identical
+    with _PIL_Image.open(ds.paths[idx_maghrebi]) as _im_sample:
+        base_a = preprocess_ink_3ch(_im_sample, augment=False)
+        base_b = preprocess_ink_3ch(_im_sample, augment=False)
+        assert torch.equal(base_a, base_b)
+        aug_a = preprocess_ink_3ch(_im_sample, augment=True, rng=_py_random.Random(101))
+        aug_b = preprocess_ink_3ch(_im_sample, augment=True, rng=_py_random.Random(202))
+        assert torch.isfinite(aug_a).all() and torch.isfinite(aug_b).all()
+        assert (aug_a.shape != base_a.shape) or (not torch.equal(aug_a, base_a)) or (not torch.equal(aug_b, base_a))
+
+    # 2) V2a model state_dict key parity (V1 backward compat) & SpecAugment train/eval behavior
+    v2a_model = UnifiedHTRModel(
+        decoder_config=tiny_cfg,
+        ctc_vocab_size=vocab.num_classes,
+        pretrained_backbone=False,
+        use_multiscale=True,
+        use_film=True,
+        use_ctc=True,
+        use_script_loss=False,
+        film_dropout=0.35,
+        spec_aug_prob=1.0,
+        spec_aug_num_masks=2,
+        spec_aug_max_ratio=0.08,
+        enc_feat_dropout=0.15,
+        label_smoothing=0.10,
+        context_dropout=0.15,
+        lambda_ctc=0.30,
+        alpha_script=0.0,
+    )
+    assert set(v2a_model.state_dict().keys()) == set(tiny_model.state_dict().keys()), (
+        "V2a state_dict keys must remain 100% compatible with V1 checkpoints!"
+    )
+
+    seq_probe = torch.ones((2, 60, 512), dtype=torch.float32)
+    lens_probe = torch.tensor([40, 25], dtype=torch.long)
+    v2a_model.eval()
+    assert torch.equal(v2a_model._apply_spec_augment(seq_probe, lens_probe), seq_probe), "SpecAugment must be no-op in eval()"
+    v2a_model.train()
+    masked_probe = v2a_model._apply_spec_augment(seq_probe, lens_probe)
+    assert not torch.equal(masked_probe, seq_probe), "SpecAugment must mask spans in train()"
+    # Padding columns past valid enc_len must stay untouched
+    assert torch.equal(masked_probe[0, 40:, :], seq_probe[0, 40:, :])
+    assert torch.equal(masked_probe[1, 25:, :], seq_probe[1, 25:, :])
+
+    # 3) Exact manual CE parity with HF TrOCRForCausalLM internal CE (ls=0.0) & ls=0.10 backward check
+    tiny_model.eval()
+    with torch.no_grad():
+        enc_ce = tiny_model.encode(pv, mask, enc_lens)
+        dec_in_ce = shift_tokens_right(batch["decoder_labels"], pad_token_id=TROCR_PAD_ID, decoder_start_token_id=TROCR_BOS_ID)
+        dec_attn_ce = (dec_in_ce != TROCR_PAD_ID).long()
+        hf_out = tiny_model.decoder(
+            input_ids=dec_in_ce,
+            attention_mask=dec_attn_ce,
+            encoder_hidden_states=enc_ce["enc_features"],
+            encoder_attention_mask=enc_ce["encoder_attention_mask"],
+            labels=batch["decoder_labels"],
+            use_cache=False,
+        )
+        manual_ce = _F.cross_entropy(
+            hf_out.logits.float().reshape(-1, hf_out.logits.size(-1)),
+            batch["decoder_labels"].reshape(-1),
+            ignore_index=-100,
+            label_smoothing=0.0,
+        )
+        ce_diff = abs(float(manual_ce.item()) - float(hf_out.loss.item()))
+        assert ce_diff < 1e-5, f"Manual CE mismatch vs HF TrOCR CE: {ce_diff}"
+
+    v2a_model.train()
+    v2a_model.zero_grad()
+    res_v2a = v2a_model(
+        pixel_values=pv,
+        encoder_attention_mask=mask,
+        enc_lengths=enc_lens,
+        decoder_labels=batch["decoder_labels"],
+        ctc_targets=batch["ctc_targets"],
+        ctc_target_lengths=batch["ctc_target_lengths"],
+        script_ids=batch["script_ids"],
+    )
+    assert torch.isfinite(res_v2a["loss"]) and torch.isfinite(res_v2a["loss_ce"])
+    assert float(res_v2a["loss_script"].item()) == 0.0
+    res_v2a["loss"].backward()
+    assert v2a_model.decoder.output_projection.weight.grad is not None
+    assert v2a_model.film.film_mlp[-1].weight.grad is not None
+
+    # 4) Validate Kaggle notebook JSON (nbformat 4) & V2a YAML selector
+    nb_path = REPO_ROOT / "kaggle" / "unified_htr_kaggle.ipynb"
+    nb_data = json.loads(nb_path.read_text(encoding="utf-8"))
+    assert nb_data.get("nbformat") == 4
+    nb_src = "\n".join("".join(c.get("source", [])) for c in nb_data.get("cells", []))
+    assert 'CONFIG_FILE      = "configs/ocr_unified_htr_v2a.yaml"' in nb_src
+    assert "--config '{REPO_DIR}/{CONFIG_FILE}'" in nb_src
+
+    print(f"[PASS 4F] V2a augment OK | SpecAugment train/eval OK | CE parity diff={ce_diff:.2e} | ls=0.10 & nbformat=4 OK")
     print("=" * 72)
     print("ALL PHASE 1 SANITY CHECKS PASSED.")
     return 0

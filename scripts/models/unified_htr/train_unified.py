@@ -251,6 +251,12 @@ def build_model_from_cfg(
         use_film=bool(mcfg.get("use_film", True)),
         use_ctc=bool(mcfg.get("use_ctc", True)),
         use_script_loss=bool(mcfg.get("use_script_loss", True)),
+        film_dropout=float(mcfg.get("film_dropout", 0.2)),
+        spec_aug_prob=float(mcfg.get("spec_aug_prob", 0.0)),
+        spec_aug_num_masks=int(mcfg.get("spec_aug_num_masks", 2)),
+        spec_aug_max_ratio=float(mcfg.get("spec_aug_max_ratio", 0.08)),
+        enc_feat_dropout=float(mcfg.get("enc_feat_dropout", 0.0)),
+        label_smoothing=float(mcfg.get("label_smoothing", 0.0)),
         context_dropout=float(mcfg.get("context_dropout", 0.10)),
         lambda_ctc=float(mcfg.get("lambda_ctc", 0.30)),
         alpha_script=float(mcfg.get("alpha_script", 0.05)),
@@ -285,8 +291,10 @@ def build_model_from_cfg(
     n_tot = sum(p.numel() for p in model.parameters())
     n_dec = sum(p.numel() for p in model.decoder.parameters())
     log(f"[MODEL] UnifiedHTRModel | total={n_tot/1e6:.2f}M (encoder={(n_tot-n_dec)/1e6:.2f}M, decoder={n_dec/1e6:.2f}M) "
-        f"| ms={common_kw['use_multiscale']} film={common_kw['use_film']} "
-        f"ctc={common_kw['use_ctc']} script={common_kw['use_script_loss']} | tiny={tiny_decoder_test}")
+        f"| ms={common_kw['use_multiscale']} film={common_kw['use_film']}(drop={common_kw['film_dropout']:.2f}) "
+        f"ctc={common_kw['use_ctc']} script={common_kw['use_script_loss']} "
+        f"| spec={common_kw['spec_aug_prob']:.2f} enc_drop={common_kw['enc_feat_dropout']:.2f} "
+        f"ctx_drop={common_kw['context_dropout']:.2f} ls={common_kw['label_smoothing']:.2f} | tiny={tiny_decoder_test}")
     return model
 
 
@@ -314,6 +322,12 @@ def save_unified_best(
             "use_film": model.use_film,
             "use_ctc": model.use_ctc,
             "use_script_loss": model.use_script_loss,
+            "film_dropout": model.film_dropout,
+            "spec_aug_prob": model.spec_aug_prob,
+            "spec_aug_num_masks": model.spec_aug_num_masks,
+            "spec_aug_max_ratio": model.spec_aug_max_ratio,
+            "enc_feat_dropout": model.enc_feat_dropout,
+            "label_smoothing": model.label_smoothing,
             "context_dropout": model.context_dropout,
             "lambda_ctc": model.lambda_ctc,
             "alpha_script": model.alpha_script,
@@ -813,6 +827,7 @@ def make_datasets(
     out: dict[str, UnifiedHTRDataset] = {}
     for name in split_names:
         split_val = tcfg.get(f"split_{name}", name)
+        use_aug = bool(dcfg.get("augment_train", False)) and (split_val == "train")
         ds = UnifiedHTRDataset(
             data_dir=data_dir,
             split=split_val,
@@ -826,11 +841,13 @@ def make_datasets(
             main_only=bool(dcfg.get("main_only", True)),
             exclude_corrupt_train=bool(dcfg.get("exclude_corrupt_train", False)),
             p_blank=float(dcfg.get("p_blank", 0.0)),
+            augment=use_aug,
             limit=limit,
             seed=int(tcfg.get("seed", 1337)),
         )
         log(f"[DATA] {name:5s}: {len(ds):6d} lines | books={sorted(set(ds.book_ids))} "
-            f"| exclude_corrupt={dcfg.get('exclude_corrupt_train', False)} | p_blank={dcfg.get('p_blank', 0.0)}")
+            f"| augment={ds.augment} | exclude_corrupt={dcfg.get('exclude_corrupt_train', False)} "
+            f"| p_blank={dcfg.get('p_blank', 0.0)}")
         out[name] = ds
     return out
 
@@ -1109,6 +1126,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--no-multiscale", action="store_true")
     ap.add_argument("--no-ctc", action="store_true")
     ap.add_argument("--no-script-loss", action="store_true")
+    ap.add_argument("--no-augment", action="store_true", help="Disable train-time visual augmentations")
     ap.add_argument("--tiny-decoder-test", action="store_true", help="CPU smoke test using tiny 2-layer TrOCRConfig")
     return ap.parse_args()
 
@@ -1139,6 +1157,8 @@ def main() -> int:
         m["use_ctc"] = False
     if args.no_script_loss:
         m["use_script_loss"] = False
+    if args.no_augment:
+        cfg.setdefault("data", {})["augment_train"] = False
 
     if args.tokenizer:
         cfg["tokenizer_path"] = args.tokenizer

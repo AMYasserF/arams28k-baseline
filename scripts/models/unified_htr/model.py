@@ -383,6 +383,12 @@ class UnifiedHTRModel(nn.Module):
         use_film: bool = True,
         use_ctc: bool = True,
         use_script_loss: bool = True,
+        film_dropout: float = 0.2,
+        spec_aug_prob: float = 0.0,
+        spec_aug_num_masks: int = 2,
+        spec_aug_max_ratio: float = 0.08,
+        enc_feat_dropout: float = 0.0,
+        label_smoothing: float = 0.0,
         context_dropout: float = 0.10,
         lambda_ctc: float = 0.30,
         alpha_script: float = 0.05,
@@ -398,6 +404,12 @@ class UnifiedHTRModel(nn.Module):
         self.use_film = bool(use_film)
         self.use_ctc = bool(use_ctc)
         self.use_script_loss = bool(use_script_loss) and self.use_film
+        self.film_dropout = float(film_dropout)
+        self.spec_aug_prob = float(spec_aug_prob)
+        self.spec_aug_num_masks = int(spec_aug_num_masks)
+        self.spec_aug_max_ratio = float(spec_aug_max_ratio)
+        self.enc_feat_dropout = float(enc_feat_dropout)
+        self.label_smoothing = float(label_smoothing)
         self.context_dropout = float(context_dropout)
         self.lambda_ctc = float(lambda_ctc)
         self.alpha_script = float(alpha_script)
@@ -422,11 +434,12 @@ class UnifiedHTRModel(nn.Module):
                 feat_dim=512,
                 style_dim=256,
                 num_scripts=self.num_scripts,
-                dropout_p=0.2,
+                dropout_p=self.film_dropout,
             )
 
-        # 4. Learned Vertical Attention Pooling (H=2 -> 1)
+        # 4. Learned Vertical Attention Pooling (H=2 -> 1) + Pre-BiLSTM Regularization
         self.vert_attn = nn.Conv2d(512, 1, kernel_size=1)
+        self.enc_feat_drop = nn.Dropout(self.enc_feat_dropout)
 
         # 5. 1D Sequence BiLSTM Encoder + 768-dim residual projection
         self.seq_lstm = nn.LSTM(
@@ -612,6 +625,9 @@ class UnifiedHTRModel(nn.Module):
         # Vertical attention pooling across H=2 -> 1
         attn_weights = F.softmax(self.vert_attn(feat), dim=2)  # (B, 1, 2, T)
         seq_in = (feat * attn_weights).sum(dim=2).transpose(1, 2).contiguous()  # (B, T, 512)
+        seq_in = self._apply_spec_augment(seq_in, aligned_lengths)
+        if self.enc_feat_dropout > 0.0:
+            seq_in = self.enc_feat_drop(seq_in)
 
         # Pack padded sequence for BiLSTM so padding never contaminates recurrent states
         safe_lens = aligned_lengths.detach().cpu().clamp(min=1, max=t_max)
@@ -634,6 +650,32 @@ class UnifiedHTRModel(nn.Module):
             "ctc_logits": ctc_logits,
             "script_logits": script_logits,
         }
+
+    def _apply_spec_augment(self, seq_in: torch.Tensor, enc_lengths: torch.Tensor) -> torch.Tensor:
+        """Mask random contiguous valid encoder spans per sample during training only."""
+        if (
+            (not self.training)
+            or self.spec_aug_prob <= 0.0
+            or self.spec_aug_num_masks <= 0
+            or self.spec_aug_max_ratio <= 0.0
+        ):
+            return seq_in
+
+        bsz, t_max, _ = seq_in.shape
+        keep_mask = torch.ones((bsz, t_max, 1), device=seq_in.device, dtype=seq_in.dtype)
+        for i in range(bsz):
+            if float(torch.rand((), device="cpu").item()) >= self.spec_aug_prob:
+                continue
+            valid_len = max(1, min(t_max, int(enc_lengths[i].item())))
+            if valid_len <= 1:
+                continue
+            max_span = min(max(1, int(valid_len * self.spec_aug_max_ratio)), valid_len - 1)
+            for _ in range(self.spec_aug_num_masks):
+                span = int(torch.randint(1, max_span + 1, ()).item())
+                start_max = max(0, valid_len - span)
+                start = int(torch.randint(0, start_max + 1, ()).item())
+                keep_mask[i, start : start + span, 0] = 0.0
+        return seq_in * keep_mask
 
     def _apply_context_dropout(self, decoder_input_ids: torch.Tensor) -> torch.Tensor:
         if (not self.training) or self.context_dropout <= 0.0:
@@ -694,15 +736,25 @@ class UnifiedHTRModel(nn.Module):
         dec_input_ids = self._apply_context_dropout(dec_input_ids)
         dec_attn_mask = (dec_input_ids != TROCR_PAD_ID).long()
 
+        use_smoothing = self.label_smoothing > 0.0
         dec_out = self.decoder(
             input_ids=dec_input_ids,
             attention_mask=dec_attn_mask,
             encoder_hidden_states=enc_features,
             encoder_attention_mask=aligned_mask,
-            labels=decoder_labels,
+            labels=(None if use_smoothing else decoder_labels),
             use_cache=False,
         )
-        loss_ce = dec_out.loss
+        if use_smoothing:
+            logits = dec_out.logits.float()
+            loss_ce = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                decoder_labels.reshape(-1),
+                ignore_index=-100,
+                label_smoothing=self.label_smoothing,
+            )
+        else:
+            loss_ce = dec_out.loss
 
         zero = loss_ce.new_zeros(())
         if self.use_ctc and ctc_logits is not None and ctc_targets is not None and ctc_target_lengths is not None:
