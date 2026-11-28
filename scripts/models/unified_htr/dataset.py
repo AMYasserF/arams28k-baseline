@@ -42,14 +42,22 @@ except ImportError:  # pragma: no cover
     uniform_filter = None
 
 
+def _round_width_bounds(min_width: int, max_width: int) -> tuple[int, int]:
+    """Ensure width bounds are valid multiples of 4 matching ResNet horizontal stride."""
+    safe_min = max(4, ((int(min_width) + 3) // 4) * 4)
+    safe_max = max(safe_min, (int(max_width) // 4) * 4)
+    return safe_min, safe_max
+
+
 def _compute_target_width(orig_w: int, orig_h: int, height: int = 64, min_width: int = 16, max_width: int = 1280) -> int:
     """Compute aspect-preserving width clamped to [min_width, max_width] and rounded up to multiple of 4."""
+    safe_min, safe_max = _round_width_bounds(min_width, max_width)
     safe_w = max(1, int(orig_w))
     safe_h = max(1, int(orig_h))
     raw_w = int(round(height * (safe_w / float(safe_h))))
-    clamped = max(min_width, min(max_width, raw_w))
+    clamped = max(safe_min, min(safe_max, raw_w))
     rounded = ((clamped + 3) // 4) * 4
-    return min(max_width, max(min_width, rounded))
+    return min(safe_max, max(safe_min, rounded))
 
 
 def _local_contrast_numpy_scipy(inv_u8: np.ndarray) -> np.ndarray:
@@ -97,8 +105,8 @@ def preprocess_ink_3ch(
     target_w = _compute_target_width(orig_w, orig_h, height=height, min_width=min_width, max_width=max_width)
 
     if orig_w <= 4 and orig_h <= 4:
-        # Degenerate dummy crop (e.g., official book_27_page_011 2x2): keep minimal W=min_width safely
-        target_w = min_width
+        # Degenerate dummy crop (e.g., official book_27_page_011 2x2): keep minimal % 4 width safely
+        target_w, _ = _round_width_bounds(min_width, max_width)
 
     resized = gray_pil.resize((target_w, height), Image.Resampling.BILINEAR)
     if rtl_flip:
@@ -231,14 +239,15 @@ def unified_collate_fn(batch: Sequence[dict[str, Any]]) -> dict[str, Any]:
     bsz = len(batch)
     channels = int(batch[0]["pixel_values"].shape[0])
     height = int(batch[0]["pixel_values"].shape[1])
-    widths = [int(item["orig_width"]) for item in batch]
-    max_w = max(widths)
-    if max_w % 4 != 0:
-        max_w = ((max_w + 3) // 4) * 4
+    widths = [int(item.get("orig_width", item["pixel_values"].shape[-1])) for item in batch]
+    max_w = max(4, ((max(widths) + 3) // 4) * 4)
 
     pixel_values = torch.zeros((bsz, channels, height, max_w), dtype=torch.float32)
-    enc_lengths = torch.tensor([w // 4 for w in widths], dtype=torch.long)
     t_enc_max = max_w // 4
+    enc_lengths = torch.tensor(
+        [min(t_enc_max, max(1, (w + 3) // 4)) for w in widths],
+        dtype=torch.long,
+    )
     encoder_attention_mask = torch.zeros((bsz, t_enc_max), dtype=torch.long)
 
     max_ctc_len = max((int(item["ctc_target_length"]) for item in batch), default=0)
@@ -250,8 +259,9 @@ def unified_collate_fn(batch: Sequence[dict[str, Any]]) -> dict[str, Any]:
     script_ids = torch.tensor([int(item["script_id"]) for item in batch], dtype=torch.long)
 
     for i, item in enumerate(batch):
-        w_i = widths[i]
-        pixel_values[i, :, :, :w_i] = item["pixel_values"]
+        pv_i = item["pixel_values"]
+        w_i = min(max_w, int(pv_i.shape[-1]))
+        pixel_values[i, :, :, :w_i] = pv_i[:, :, :w_i]
         t_i = int(enc_lengths[i].item())
         encoder_attention_mask[i, :t_i] = 1
 

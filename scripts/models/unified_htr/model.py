@@ -13,6 +13,7 @@ Combines:
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import TrOCRConfig, TrOCRForCausalLM
+
+try:
+    from transformers import DynamicCache, EncoderDecoderCache
+except ImportError:  # pragma: no cover
+    DynamicCache = None
+    EncoderDecoderCache = None
 
 try:
     from torchvision.models import ResNet34_Weights, resnet34 as _tv_resnet34
@@ -474,13 +481,102 @@ class UnifiedHTRModel(nn.Module):
         for p in self.decoder.parameters():
             p.requires_grad = not frozen
 
+    @staticmethod
+    def _pad_pixel_values_to_stride4(pixel_values: torch.Tensor) -> torch.Tensor:
+        """Right-pad image width with 0.0 to a multiple of 4 so CNN output width is exact W // 4."""
+        w = int(pixel_values.shape[-1])
+        rem = w % 4
+        if rem != 0:
+            pixel_values = F.pad(pixel_values, (0, 4 - rem), mode="constant", value=0.0)
+        return pixel_values
+
+    @staticmethod
+    def _align_encoder_mask_and_lengths(
+        encoder_attention_mask: torch.Tensor | None,
+        enc_lengths: torch.Tensor | None,
+        t_max: int,
+        bsz: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Align 2D encoder_attention_mask and 1D enc_lengths strictly to spatial width t_max."""
+        if encoder_attention_mask is not None:
+            mask = encoder_attention_mask.to(device=device, dtype=torch.long)
+            if mask.ndim != 2 or mask.shape[0] != bsz:
+                raise ValueError(
+                    f"encoder_attention_mask must have shape ({bsz}, T), got {tuple(mask.shape)}"
+                )
+            m_len = int(mask.shape[1])
+            if m_len < t_max:
+                mask = F.pad(mask, (0, t_max - m_len), mode="constant", value=0)
+            elif m_len > t_max:
+                mask = mask[:, :t_max]
+        elif enc_lengths is not None:
+            lens_tmp = enc_lengths.to(device=device, dtype=torch.long).clamp(min=1, max=t_max)
+            pos = torch.arange(t_max, device=device, dtype=torch.long).unsqueeze(0)
+            mask = (pos < lens_tmp.unsqueeze(1)).long()
+        else:
+            mask = torch.ones((bsz, t_max), device=device, dtype=torch.long)
+
+        if enc_lengths is not None:
+            lens = enc_lengths.to(device=device, dtype=torch.long).clamp(min=1, max=t_max)
+        else:
+            lens = mask.sum(dim=1).clamp(min=1, max=t_max).long()
+        return mask, lens
+
+    def _ensure_cross_attn_mask(
+        self,
+        enc_features: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Align and validate encoder_attention_mask directly against encoder_hidden_states.shape[1]."""
+        bsz, src_len = int(enc_features.shape[0]), int(enc_features.shape[1])
+        mask, _ = self._align_encoder_mask_and_lengths(
+            encoder_attention_mask=encoder_attention_mask,
+            enc_lengths=None,
+            t_max=src_len,
+            bsz=bsz,
+            device=enc_features.device,
+        )
+        if mask.shape != (bsz, src_len):
+            raise ValueError(
+                f"Cross-attention mask shape mismatch: expected {(bsz, src_len)}, got {tuple(mask.shape)}"
+            )
+        return mask
+
+    def _decoder_uses_encoder_decoder_cache(self) -> bool:
+        """Detect transformers >= 5.x Cache-based TrOCRDecoder where EncoderDecoderCache is required."""
+        if DynamicCache is None or EncoderDecoderCache is None:
+            return False
+        supports_fn = getattr(self.decoder, "_supports_default_dynamic_cache", None)
+        if not (callable(supports_fn) and bool(supports_fn())):
+            return False
+        try:
+            layers = self.decoder.model.decoder.layers
+            if len(layers) == 0:
+                return False
+            enc_attn = getattr(layers[0], "encoder_attn", None)
+            if enc_attn is None:
+                return False
+            return "past_key_values" in inspect.signature(enc_attn.forward).parameters
+        except Exception:
+            return False
+
+    def _build_decoder_past_key_values(self) -> Any | None:
+        """Build EncoderDecoderCache so self-attn and cross-attn do not share a single DynamicCache."""
+        if not self._decoder_uses_encoder_decoder_cache():
+            return None
+        dc_params = inspect.signature(DynamicCache.__init__).parameters
+        dc_kwargs = {"config": self.decoder.config} if "config" in dc_params else {}
+        return EncoderDecoderCache(DynamicCache(**dc_kwargs), DynamicCache(**dc_kwargs))
+
     def encode(
         self,
         pixel_values: torch.Tensor,
-        encoder_attention_mask: torch.Tensor,
-        enc_lengths: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None = None,
+        enc_lengths: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
         """Run CNN + optional MultiScale/FiLM + Vertical Attn Pool + BiLSTM -> (B, T, 768)."""
+        pixel_values = self._pad_pixel_values_to_stride4(pixel_values)
         x = self.backbone.conv1(pixel_values)
         x = self.backbone.bn1(x)
         x = self.backbone.relu(x)
@@ -491,7 +587,14 @@ class UnifiedHTRModel(nn.Module):
         s4 = self.backbone.layer4(s3)  # (B, 512, 2, W/4)
 
         bsz, _, _, t_max = s4.shape
-        col_mask = encoder_attention_mask.to(dtype=s4.dtype).view(bsz, 1, 1, t_max)
+        aligned_mask, aligned_lengths = self._align_encoder_mask_and_lengths(
+            encoder_attention_mask=encoder_attention_mask,
+            enc_lengths=enc_lengths,
+            t_max=t_max,
+            bsz=bsz,
+            device=s4.device,
+        )
+        col_mask = aligned_mask.to(dtype=s4.dtype).view(bsz, 1, 1, t_max)
         s2_masked = s2 * col_mask
         s4_masked = s4 * col_mask
 
@@ -503,7 +606,7 @@ class UnifiedHTRModel(nn.Module):
 
         script_logits: torch.Tensor | None = None
         if self.use_film:
-            feat, script_logits = self.film(s2_masked, s4_masked, feat, encoder_attention_mask)
+            feat, script_logits = self.film(s2_masked, s4_masked, feat, aligned_mask)
             feat = feat * col_mask
 
         # Vertical attention pooling across H=2 -> 1
@@ -511,7 +614,7 @@ class UnifiedHTRModel(nn.Module):
         seq_in = (feat * attn_weights).sum(dim=2).transpose(1, 2).contiguous()  # (B, T, 512)
 
         # Pack padded sequence for BiLSTM so padding never contaminates recurrent states
-        safe_lens = enc_lengths.detach().cpu().clamp(min=1, max=t_max)
+        safe_lens = aligned_lengths.detach().cpu().clamp(min=1, max=t_max)
         packed = nn.utils.rnn.pack_padded_sequence(
             seq_in, safe_lens, batch_first=True, enforce_sorted=False
         )
@@ -521,11 +624,13 @@ class UnifiedHTRModel(nn.Module):
             packed_out, batch_first=True, total_length=t_max
         )
         enc_features = self.enc_norm(lstm_out + self.enc_proj(lstm_out))
-        enc_features = enc_features * encoder_attention_mask.unsqueeze(-1).to(dtype=enc_features.dtype)
+        enc_features = enc_features * aligned_mask.unsqueeze(-1).to(dtype=enc_features.dtype)
 
         ctc_logits = self.ctc_head(enc_features) if self.use_ctc else None
         return {
             "enc_features": enc_features,
+            "encoder_attention_mask": aligned_mask,
+            "enc_lengths": aligned_lengths,
             "ctc_logits": ctc_logits,
             "script_logits": script_logits,
         }
@@ -578,6 +683,8 @@ class UnifiedHTRModel(nn.Module):
         """Compute joint CE + Aux-CTC + Aux-Script loss."""
         enc = self.encode(pixel_values, encoder_attention_mask, enc_lengths)
         enc_features = enc["enc_features"]
+        aligned_mask = self._ensure_cross_attn_mask(enc_features, enc["encoder_attention_mask"])
+        aligned_lengths = enc["enc_lengths"]
         ctc_logits = enc["ctc_logits"]
         script_logits = enc["script_logits"]
 
@@ -591,7 +698,7 @@ class UnifiedHTRModel(nn.Module):
             input_ids=dec_input_ids,
             attention_mask=dec_attn_mask,
             encoder_hidden_states=enc_features,
-            encoder_attention_mask=encoder_attention_mask,
+            encoder_attention_mask=aligned_mask,
             labels=decoder_labels,
             use_cache=False,
         )
@@ -599,7 +706,7 @@ class UnifiedHTRModel(nn.Module):
 
         zero = loss_ce.new_zeros(())
         if self.use_ctc and ctc_logits is not None and ctc_targets is not None and ctc_target_lengths is not None:
-            loss_ctc = self._compute_ctc_loss(ctc_logits, ctc_targets, enc_lengths, ctc_target_lengths)
+            loss_ctc = self._compute_ctc_loss(ctc_logits, ctc_targets, aligned_lengths, ctc_target_lengths)
             eff_lambda = self.lambda_ctc
         else:
             loss_ctc = zero
@@ -641,10 +748,12 @@ class UnifiedHTRModel(nn.Module):
         self.eval()
         enc = self.encode(pixel_values, encoder_attention_mask, enc_lengths)
         enc_features = enc["enc_features"]
+        aligned_mask = self._ensure_cross_attn_mask(enc_features, enc["encoder_attention_mask"])
+        aligned_lengths = enc["enc_lengths"]
 
         kw: dict[str, Any] = {
             "encoder_hidden_states": enc_features,
-            "encoder_attention_mask": encoder_attention_mask,
+            "encoder_attention_mask": aligned_mask,
             "decoder_start_token_id": TROCR_BOS_ID,
             "bos_token_id": TROCR_BOS_ID,
             "pad_token_id": TROCR_PAD_ID,
@@ -656,6 +765,10 @@ class UnifiedHTRModel(nn.Module):
         if int(num_beams) > 1 and "length_penalty" not in gen_kwargs:
             kw["length_penalty"] = 0.0
         kw.update(gen_kwargs)
+        if bool(kw.get("use_cache", True)) and "past_key_values" not in kw:
+            past_kv = self._build_decoder_past_key_values()
+            if past_kv is not None:
+                kw["past_key_values"] = past_kv
 
         out_ids = self.decoder.generate(**kw)
         dec_texts = tokenizer.batch_decode(out_ids.tolist(), skip_special_tokens=True)
@@ -670,7 +783,7 @@ class UnifiedHTRModel(nn.Module):
         if ctc_logits is not None and ctc_vocab is not None:
             pred_ids = ctc_logits.argmax(dim=-1).cpu()
             for i in range(pred_ids.shape[0]):
-                t_i = int(enc_lengths[i].item())
+                t_i = int(aligned_lengths[i].item())
                 ctc_texts.append(ctc_vocab.decode_greedy(pred_ids[i, :t_i].tolist()))
         else:
             ctc_texts = ["" for _ in dec_texts]

@@ -296,6 +296,102 @@ def main() -> int:
     assert ctc_hist[-1] < ctc_hist[0], f"CTC loss did not drop: {ctc_hist[0]:.4f} -> {ctc_hist[-1]:.4f}"
     print(f"[PASS 4D] 15-step CPU convergence: CE {ce_hist[0]:.3f} -> {ce_hist[-1]:.3f} | "
           f"CTC {ctc_hist[0]:.3f} -> {ctc_hist[-1]:.3f} | 0 NaN/Inf")
+
+    # ── 4E. Variable-width & non-multiple-of-4 generate() + Kaggle val B=8 regression ──
+    import numpy as np
+    import types
+
+    tiny_model.eval()
+    # 1) Direct non-multiple-of-4 widths & varying batch sizes (B=1, 4, 8), greedy & beam search
+    for bsz_t, widths_t in (
+        (1, [73]),
+        (4, [61, 105, 137, 185]),
+        (8, [73, 101, 129, 185, 211, 247, 303, 355]),
+    ):
+        max_wt = max(widths_t)
+        pv_odd = torch.rand((bsz_t, 3, 64, max_wt), dtype=torch.float32)
+        t_guess = max_wt // 4  # Deliberately unpadded floor width (non-%4) to stress alignment
+        mask_odd = torch.ones((bsz_t, t_guess), dtype=torch.long)
+        lens_odd = torch.tensor([(w + 3) // 4 for w in widths_t], dtype=torch.long)
+        for idx_r, lr_v in enumerate(lens_odd.tolist()):
+            if lr_v < t_guess:
+                mask_odd[idx_r, lr_v:] = 0
+        enc_check = tiny_model.encode(pv_odd, mask_odd, lens_odd)
+        t_enc_expected = ((max_wt + 3) // 4)
+        assert enc_check["enc_features"].shape == (bsz_t, t_enc_expected, 768)
+        assert enc_check["encoder_attention_mask"].shape == (bsz_t, t_enc_expected)
+        for nb in (1, 3):
+            out_dec = tiny_model.generate(
+                pv_odd, mask_odd, lens_odd, tokenizer=tok, num_beams=nb, max_new_tokens=6
+            )
+            assert len(out_dec) == bsz_t and all(isinstance(s, str) for s in out_dec)
+
+    # 2) Collated non-multiple-of-4 synthetic items & real AraMS-28k val linspace B=8 batch
+    odd_items = []
+    for i, w_raw in enumerate([69, 133, 181, 219, 255]):
+        r_idx = i % 4
+        c_len = int(batch["ctc_target_lengths"][r_idx].item())
+        odd_items.append({
+            "pixel_values": torch.rand((3, 64, w_raw), dtype=torch.float32),
+            "orig_width": w_raw,
+            "decoder_labels": batch["decoder_labels"][r_idx].clone(),
+            "ctc_targets": batch["ctc_targets"][r_idx, :c_len].clone(),
+            "ctc_target_length": c_len,
+            "script_id": int(batch["script_ids"][r_idx].item()),
+            "line_uid": f"odd_{i}",
+            "book_id": "book_20",
+            "gt_normalized": batch["gt_normalized"][r_idx],
+        })
+    odd_batch = unified_collate_fn(odd_items)
+    assert odd_batch["pixel_values"].shape[-1] == 256
+    assert odd_batch["encoder_attention_mask"].shape == (5, 64)
+    assert odd_batch["enc_lengths"].tolist() == [18, 34, 46, 55, 64]
+
+    ds_val = UnifiedHTRDataset(data_dir=data_dir, split="val", tokenizer=tok, ctc_vocab=vocab, limit=200)
+    idx_val = sorted(set(np.linspace(0, len(ds_val) - 1, 8).astype(int).tolist()))
+    b_val = unified_collate_fn([ds_val[i] for i in idx_val])
+    assert b_val["pixel_values"].shape == (8, 3, 64, 736)
+    assert b_val["encoder_attention_mask"].shape == (8, 184)
+    for nb in (1, 3):
+        val_dec, val_ctc = tiny_model.generate(
+            b_val["pixel_values"],
+            b_val["encoder_attention_mask"],
+            b_val["enc_lengths"],
+            tokenizer=tok,
+            ctc_vocab=vocab,
+            num_beams=nb,
+            max_new_tokens=8,
+            return_ctc=True,
+        )
+        assert len(val_dec) == 8 and len(val_ctc) == 8
+
+    # 3) Verify transformers v5 Cache detector returns EncoderDecoderCache when past_key_values cache API is active
+    from transformers import DynamicCache as _HF_DynCache, EncoderDecoderCache as _HF_EDCache
+
+    class _FakeCrossAttn(torch.nn.Module):
+        def forward(self, hidden_states, key_value_states=None, past_key_values=None):
+            return hidden_states
+
+    native_cache = tiny_model._build_decoder_past_key_values()
+    if tiny_model._decoder_uses_encoder_decoder_cache():
+        assert isinstance(native_cache, _HF_EDCache)
+    else:
+        assert native_cache is None
+
+    orig_supports = tiny_model.decoder._supports_default_dynamic_cache
+    orig_enc_attn = tiny_model.decoder.model.decoder.layers[0].encoder_attn
+    try:
+        tiny_model.decoder._supports_default_dynamic_cache = types.MethodType(lambda _self: True, tiny_model.decoder)
+        tiny_model.decoder.model.decoder.layers[0].encoder_attn = _FakeCrossAttn()
+        built_cache = tiny_model._build_decoder_past_key_values()
+        assert isinstance(built_cache, _HF_EDCache), f"Expected EncoderDecoderCache, got {type(built_cache)}"
+        assert isinstance(built_cache.self_attention_cache, _HF_DynCache)
+        assert isinstance(built_cache.cross_attention_cache, _HF_DynCache)
+    finally:
+        tiny_model.decoder._supports_default_dynamic_cache = orig_supports
+        tiny_model.decoder.model.decoder.layers[0].encoder_attn = orig_enc_attn
+
+    print("[PASS 4E] generate() verified on B={1,4,8}, non-%4 widths, val B=8 linspace (W=736), & EncoderDecoderCache")
     print("=" * 72)
     print("ALL PHASE 1 SANITY CHECKS PASSED.")
     return 0
