@@ -1,0 +1,65 @@
+# Unified Script-Aware Hybrid CTC/Attention HTR on AraMS-28k-HTR
+#
+# Replaces HATFormer's ViT + BlockProcessor with an asymmetric-stride ResNet-34
+# + Masked FiLM + Multi-Scale + Vertical Attention Pool + BiLSTM + Aux CTC head,
+# while initializing the decoder cleanly from pre-AraMS `hatformer-muharaf` TrOCRForCausalLM.
+
+tokenizer_path: scripts/models/hatformer/tokenizer/tokenizer.json   # 50,265-token Arabic BBPE
+
+checkpoints:
+  muharaf: checkpoints/hatformer/original/hatformer-muharaf
+
+image:
+  height: 64
+  min_width: 16
+  max_width: 1280
+  rtl_flip: true
+
+data:
+  max_text_length: 64
+  main_only: true
+  exclude_corrupt_train: false   # STRICT: preserve all 19,739 official train lines
+  p_blank: 0.0                   # STRICT: disabled by default
+
+model:
+  use_multiscale: true
+  use_film: true
+  use_ctc: true
+  use_script_loss: true
+  context_dropout: 0.10
+  lambda_ctc: 0.30
+  alpha_script: 0.05
+  pretrained_backbone: true
+
+train:
+  split_train: train
+  split_val: val
+  seed: 1337
+  batch_size: 8
+  grad_accum: 1
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-6
+  grad_clip: 5.0
+  max_steps: 20000
+
+  # Stage 1: train vision/FiLM/BiLSTM/CTC encoder with TrOCR decoder frozen
+  stage1_steps: 3000
+  stage1_lr: 3.0e-4
+  stage1_warmup: 300
+
+  # Stage 2: unfreeze TrOCR decoder with differential cosine LRs down to min_lr
+  stage2_encoder_lr: 1.0e-4
+  stage2_decoder_lr: 5.0e-5
+  stage2_warmup: 500
+  min_lr: 1.0e-6
+
+  val_every_steps: 1000
+  ckpt_every_steps: 1000
+  val_max_lines: 256
+  val_num_beams: 1
+  eval_batch_size: 32
+  log_every_steps: 50
+  num_workers: 4
+  precision: amp_fp16
+  time_budget_hours: 11.0
